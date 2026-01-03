@@ -1,0 +1,12 @@
+# IDE
+.idea/
+.vscode/
+
+# deps (на всякий)
+node_modules/
+**/node_modules/
+
+# env (на всякий)
+.env
+.env.*
+!**/.env.example
