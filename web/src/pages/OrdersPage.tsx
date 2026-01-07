@@ -1,13 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { onAuthStateChanged } from "firebase/auth";
-import {
-    collection,
-    onSnapshot,
-    orderBy,
-    query,
-    where,
-    Timestamp,
-} from "firebase/firestore";
+import { collection, onSnapshot, orderBy, query, where, Timestamp } from "firebase/firestore";
 import { auth, db } from "../lib/firebase";
 import { useNavigate } from "react-router-dom";
 
@@ -19,22 +12,20 @@ type OrderDoc = {
     restaurantId: string;
 
     customerName: string;
-    deliveryAddress: string;
-    phone?: string;
-    note?: string;
+    customerAddress: string;
+    customerPhone?: string;
+    notes?: string;
 
-    paymentMethod: PaymentMethod;
+    paymentType: PaymentMethod;
 
-    itemsTotal: number;
+    orderSubtotal: number;
     deliveryFee: number;
     orderTotal: number;
 
-    // Денежная логика по твоим правилам:
-    // CASH: collectFromCustomer = orderTotal, courierOwesRestaurant = itemsTotal, restaurantPaysCourier = 0
-    // CARD: collectFromCustomer = 0, courierOwesRestaurant = 0, restaurantPaysCourier = deliveryFee
-    collectFromCustomer: number;
-    courierOwesRestaurant: number;
-    restaurantPaysCourier: number;
+    // Денежная логика (как в NewOrderPage):
+    courierPaysAtPickup: number;
+    courierCollectsFromCustomer: number;
+    courierGetsFromRestaurantAtPickup: number;
 
     status: OrderStatus;
     createdAt?: Timestamp;
@@ -113,19 +104,19 @@ export function OrdersPage() {
                         restaurantId: data.restaurantId,
 
                         customerName: data.customerName ?? "",
-                        deliveryAddress: data.deliveryAddress ?? "",
-                        phone: data.phone ?? "",
-                        note: data.note ?? "",
+                        customerAddress: data.customerAddress ?? "",
+                        customerPhone: data.customerPhone ?? "",
+                        notes: data.notes ?? "",
 
-                        paymentMethod: (data.paymentMethod ?? "cash") as PaymentMethod,
+                        paymentType: (data.paymentType ?? "cash") as PaymentMethod,
 
-                        itemsTotal: Number(data.itemsTotal ?? 0),
+                        orderSubtotal: Number(data.orderSubtotal ?? 0),
                         deliveryFee: Number(data.deliveryFee ?? 0),
                         orderTotal: Number(data.orderTotal ?? 0),
 
-                        collectFromCustomer: Number(data.collectFromCustomer ?? 0),
-                        courierOwesRestaurant: Number(data.courierOwesRestaurant ?? 0),
-                        restaurantPaysCourier: Number(data.restaurantPaysCourier ?? 0),
+                        courierPaysAtPickup: Number(data.courierPaysAtPickup ?? 0),
+                        courierCollectsFromCustomer: Number(data.courierCollectsFromCustomer ?? 0),
+                        courierGetsFromRestaurantAtPickup: Number(data.courierGetsFromRestaurantAtPickup ?? 0),
 
                         status: (data.status ?? "new") as OrderStatus,
                         createdAt: data.createdAt,
@@ -146,18 +137,16 @@ export function OrdersPage() {
 
     const stats = useMemo(() => {
         const total = orders.length;
-        const byStatus = orders.reduce(
-            (acc, o) => {
-                acc[o.status] = (acc[o.status] ?? 0) + 1;
-                return acc;
-            },
-            {} as Record<OrderStatus, number>
-        );
+        const byStatus = orders.reduce((acc, o) => {
+            acc[o.status] = (acc[o.status] ?? 0) + 1;
+            return acc;
+        }, {} as Record<OrderStatus, number>);
         return { total, byStatus };
     }, [orders]);
 
     const goNewOrder = () => {
-        navigate("/app/orders/new");
+        // ✅ ВАЖНО: новая ресторанная зона
+        navigate("/restaurant/app/orders/new");
     };
 
     if (!uid) {
@@ -183,8 +172,8 @@ export function OrdersPage() {
                 <div>
                     <h2 style={{ margin: 0 }}>Orders</h2>
                     <div style={{ fontSize: 12, color: "#888", marginTop: 4 }}>
-                        Total: {stats.total} · NEW: {stats.byStatus.new ?? 0} · TAKEN:{" "}
-                        {stats.byStatus.taken ?? 0} · DELIVERED: {stats.byStatus.delivered ?? 0}
+                        Total: {stats.total} · NEW: {stats.byStatus.new ?? 0} · TAKEN: {stats.byStatus.taken ?? 0} · DELIVERED:{" "}
+                        {stats.byStatus.delivered ?? 0}
                     </div>
                 </div>
 
@@ -212,7 +201,7 @@ export function OrdersPage() {
 
             <div style={{ display: "grid", gap: 12, marginTop: 12 }}>
                 {orders.map((o) => {
-                    const isCash = o.paymentMethod === "cash";
+                    const isCash = o.paymentType === "cash";
 
                     return (
                         <div
@@ -234,30 +223,14 @@ export function OrdersPage() {
                                     gap: 12,
                                 }}
                             >
-                                <div style={{ fontWeight: 700 }}>
-                                    Order #{o.id.slice(0, 6).toUpperCase()}
-                                </div>
+                                <div style={{ fontWeight: 700 }}>Order #{o.id.slice(0, 6).toUpperCase()}</div>
 
                                 <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
-                                    <div
-                                        style={{
-                                            fontSize: 12,
-                                            padding: "4px 8px",
-                                            borderRadius: 999,
-                                            border: "1px solid #555",
-                                        }}
-                                    >
-                                        {paymentLabel(o.paymentMethod)}
+                                    <div style={{ fontSize: 12, padding: "4px 8px", borderRadius: 999, border: "1px solid #555" }}>
+                                        {paymentLabel(o.paymentType)}
                                     </div>
 
-                                    <div
-                                        style={{
-                                            fontSize: 12,
-                                            padding: "4px 8px",
-                                            borderRadius: 999,
-                                            border: "1px solid #555",
-                                        }}
-                                    >
+                                    <div style={{ fontSize: 12, padding: "4px 8px", borderRadius: 999, border: "1px solid #555" }}>
                                         {statusLabel(o.status)}
                                     </div>
                                 </div>
@@ -269,18 +242,18 @@ export function OrdersPage() {
                             </div>
 
                             <div style={{ fontSize: 14 }}>
-                                <b>Address:</b> {o.deliveryAddress || "—"}
+                                <b>Address:</b> {o.customerAddress || "—"}
                             </div>
 
-                            {o.phone && (
+                            {o.customerPhone && (
                                 <div style={{ fontSize: 14 }}>
-                                    <b>Phone:</b> {o.phone}
+                                    <b>Phone:</b> {o.customerPhone}
                                 </div>
                             )}
 
-                            {o.note && (
+                            {o.notes && (
                                 <div style={{ fontSize: 13, color: "#aaa" }}>
-                                    <b>Note:</b> {o.note}
+                                    <b>Note:</b> {o.notes}
                                 </div>
                             )}
 
@@ -295,12 +268,12 @@ export function OrdersPage() {
                                 }}
                             >
                                 <div style={{ display: "flex", justifyContent: "space-between" }}>
-                                    <span style={{ color: "#aaa" }}>Items</span>
-                                    <b>{money(o.itemsTotal)}</b>
+                                    <span style={{ color: "#aaa" }}>Subtotal</span>
+                                    <b>{money(o.orderSubtotal)}</b>
                                 </div>
 
                                 <div style={{ display: "flex", justifyContent: "space-between" }}>
-                                    <span style={{ color: "#aaa" }}>Delivery</span>
+                                    <span style={{ color: "#aaa" }}>Delivery fee</span>
                                     <b>{money(o.deliveryFee)}</b>
                                 </div>
 
@@ -314,48 +287,40 @@ export function OrdersPage() {
                                 {isCash ? (
                                     <>
                                         <div style={{ display: "flex", justifyContent: "space-between" }}>
-                                            <span style={{ color: "#aaa" }}>Courier collects from customer</span>
-                                            <b>{money(o.collectFromCustomer)}</b>
+                                            <span style={{ color: "#aaa" }}>Courier pays restaurant at pickup</span>
+                                            <b>{money(o.courierPaysAtPickup)}</b>
                                         </div>
 
                                         <div style={{ display: "flex", justifyContent: "space-between" }}>
-                                            <span style={{ color: "#aaa" }}>Courier pays restaurant (items)</span>
-                                            <b>{money(o.courierOwesRestaurant)}</b>
+                                            <span style={{ color: "#aaa" }}>Courier collects from customer</span>
+                                            <b>{money(o.courierCollectsFromCustomer)}</b>
                                         </div>
 
                                         <div style={{ fontSize: 12, color: "#888", marginTop: 4 }}>
-                                            Rule: CASH → courier pays <b>items</b> to restaurant when picking up the order.
+                                            Rule: CASH → courier pays <b>subtotal</b> to restaurant at pickup; collects <b>subtotal+fee</b> from customer.
                                         </div>
                                     </>
                                 ) : (
                                     <>
                                         <div style={{ display: "flex", justifyContent: "space-between" }}>
                                             <span style={{ color: "#aaa" }}>Courier collects from customer</span>
-                                            <b>{money(o.collectFromCustomer)}</b>
+                                            <b>₪0.00</b>
                                         </div>
 
                                         <div style={{ display: "flex", justifyContent: "space-between" }}>
-                                            <span style={{ color: "#aaa" }}>Restaurant pays courier (delivery)</span>
-                                            <b>{money(o.restaurantPaysCourier)}</b>
+                                            <span style={{ color: "#aaa" }}>Restaurant pays courier at pickup</span>
+                                            <b>{money(o.courierGetsFromRestaurantAtPickup)}</b>
                                         </div>
 
                                         <div style={{ fontSize: 12, color: "#888", marginTop: 4 }}>
-                                            Rule: CARD → customer pays restaurant online, courier gets delivery fee from restaurant.
+                                            Rule: CARD → customer already paid; courier gets <b>fee</b> from restaurant at pickup.
                                         </div>
                                     </>
                                 )}
                             </div>
 
                             {/* Footer */}
-                            <div
-                                style={{
-                                    display: "flex",
-                                    justifyContent: "space-between",
-                                    marginTop: 2,
-                                    color: "#aaa",
-                                    fontSize: 12,
-                                }}
-                            >
+                            <div style={{ display: "flex", justifyContent: "space-between", marginTop: 2, color: "#aaa", fontSize: 12 }}>
                                 <div>
                                     <b>Created:</b> {formatDate(o.createdAt)}
                                 </div>

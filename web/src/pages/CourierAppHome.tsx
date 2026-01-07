@@ -1,12 +1,14 @@
-import { useEffect, useMemo, useState } from "react";
+import { useMemo, useRef, useState } from "react";
 import { auth, db } from "../lib/firebase";
 import { doc, serverTimestamp, setDoc } from "firebase/firestore";
 import { signOut } from "firebase/auth";
 import { useNavigate } from "react-router-dom";
+import { geohashForLocation } from "geofire-common";
 
 export default function CourierAppHome() {
     const nav = useNavigate();
     const user = auth.currentUser;
+    const watchId = useRef<number | null>(null);
 
     const courierRef = useMemo(() => {
         if (!user) return null;
@@ -14,77 +16,88 @@ export default function CourierAppHome() {
     }, [user]);
 
     const [isOnline, setIsOnline] = useState(false);
-    const [saving, setSaving] = useState(false);
     const [err, setErr] = useState<string | null>(null);
 
     async function setOnline(next: boolean) {
         if (!courierRef || !user) return;
         setErr(null);
-        setSaving(true);
+
+        if (!next && watchId.current !== null) {
+            navigator.geolocation.clearWatch(watchId.current);
+            watchId.current = null;
+        }
+
         try {
             await setDoc(
                 courierRef,
                 {
-                    updatedAt: serverTimestamp(),
-                    lastSeenAt: serverTimestamp(),
                     isOnline: next,
-                    status: "active", // на всякий, если нет
+                    lastSeenAt: serverTimestamp(),
+                    updatedAt: serverTimestamp(),
                 },
                 { merge: true }
             );
+
             setIsOnline(next);
+
+            if (next) startTracking();
         } catch (e: any) {
             setErr(e?.message ?? "Failed to update status");
-        } finally {
-            setSaving(false);
         }
     }
 
-    // Пока курьер online — обновляем lastSeenAt каждые 20 секунд
-    useEffect(() => {
-        if (!isOnline) return;
+    function startTracking() {
         if (!courierRef) return;
+        if (!navigator.geolocation) {
+            setErr("Geolocation not supported");
+            return;
+        }
 
-        const id = setInterval(async () => {
-            try {
+        watchId.current = navigator.geolocation.watchPosition(
+            async (pos) => {
+                const { latitude, longitude } = pos.coords;
+                const geohash = geohashForLocation([latitude, longitude]);
+
                 await setDoc(
                     courierRef,
-                    { lastSeenAt: serverTimestamp(), updatedAt: serverTimestamp() },
+                    {
+                        lat: latitude,
+                        lng: longitude,
+                        geohash,
+                        lastSeenAt: serverTimestamp(),
+                        updatedAt: serverTimestamp(),
+                    },
                     { merge: true }
                 );
-            } catch {
-                // молча: это только heartbeat
+            },
+            (error) => {
+                setErr(error.message);
+            },
+            {
+                enableHighAccuracy: true,
+                maximumAge: 10_000,
+                timeout: 10_000,
             }
-        }, 20_000);
-
-        return () => clearInterval(id);
-    }, [isOnline, courierRef]);
+        );
+    }
 
     async function logout() {
-        // При выходе выключаем online, чтобы не “висел” онлайн
-        if (isOnline) {
-            try {
-                await setOnline(false);
-            } catch {}
-        }
+        try {
+            if (isOnline) await setOnline(false);
+        } catch {}
         await signOut(auth);
         nav("/courier/login");
     }
 
     if (!user) {
-        return (
-            <div style={{ padding: 16 }}>
-                <h2>Courier App</h2>
-                <p>Not authorized</p>
-            </div>
-        );
+        return <div style={{ padding: 16 }}>Not authorized</div>;
     }
 
     return (
         <div style={{ padding: 16, maxWidth: 520 }}>
             <h2>Courier App</h2>
 
-            <div style={{ display: "flex", gap: 12, alignItems: "center", margin: "16px 0" }}>
+            <div style={{ display: "flex", gap: 12, margin: "16px 0" }}>
         <span>
           Status:{" "}
             <b style={{ color: isOnline ? "green" : "gray" }}>
@@ -92,10 +105,10 @@ export default function CourierAppHome() {
           </b>
         </span>
 
-                <button onClick={() => setOnline(true)} disabled={saving || isOnline}>
+                <button onClick={() => setOnline(true)} disabled={isOnline}>
                     Go online
                 </button>
-                <button onClick={() => setOnline(false)} disabled={saving || !isOnline}>
+                <button onClick={() => setOnline(false)} disabled={!isOnline}>
                     Go offline
                 </button>
 
@@ -107,7 +120,7 @@ export default function CourierAppHome() {
             {err && <p style={{ color: "crimson" }}>{err}</p>}
 
             <p style={{ marginTop: 12 }}>
-                Следующий шаг: добавим геопозицию (lat/lng/geohash) и затем offers.
+                Геопозиция обновляется, пока приложение открыто.
             </p>
         </div>
     );
