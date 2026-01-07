@@ -1,18 +1,18 @@
 import { useEffect, useMemo, useState } from "react";
-import { addDoc, collection, serverTimestamp } from "firebase/firestore";
 import { onAuthStateChanged } from "firebase/auth";
+import { addDoc, collection, serverTimestamp } from "firebase/firestore";
 import { auth, db } from "../lib/firebase";
 import { Link, useNavigate } from "react-router-dom";
-import { geohashForLocation } from "geofire-common";
 import { AddressAutocomplete } from "../components/AddressAutocomplete";
 import type { AddressSuggestion } from "../components/AddressAutocomplete";
-
 
 type PaymentType = "cash" | "card";
 
 type FormState = {
     customerName: string;
     customerPhone: string;
+
+    // текстовый адрес (храним в заказе)
     customerAddress: string;
 
     orderSubtotal: string; // стоимость еды/заказа
@@ -22,10 +22,12 @@ type FormState = {
     notes: string;
 };
 
-type Errors = Partial<Record<keyof FormState, string>> & { customerAddressPick?: string };
+type Errors = Partial<Record<keyof FormState, string>> & {
+    customerAddressPick?: string;
+};
 
 function onlyDigits(s: string) {
-    return s.replace(/\D/g, "");
+    return String(s || "").replace(/\D/g, "");
 }
 
 function toNumber(s: string) {
@@ -43,13 +45,8 @@ export function NewOrderPage() {
     const [submitError, setSubmitError] = useState("");
     const [wasSubmitted, setWasSubmitted] = useState(false);
 
-    // --- Dropoff geo (выбранный адрес) ---
-    const [dropoff, setDropoff] = useState<{
-        lat: number | null;
-        lng: number | null;
-        geohash: string | null;
-        label: string | null;
-    }>({ lat: null, lng: null, geohash: null, label: null });
+    // выбранный адрес из подсказок (важно!)
+    const [pickedAddress, setPickedAddress] = useState<AddressSuggestion | null>(null);
 
     const [form, setForm] = useState<FormState>({
         customerName: "",
@@ -86,21 +83,21 @@ export function NewOrderPage() {
         const phoneDigits = onlyDigits(form.customerPhone);
         if (phoneDigits.length < 9) e.customerPhone = "Телефон должен содержать минимум 9 цифр (обычно 10).";
 
-        // ВАЖНО: адрес должен быть выбран из подсказок (координаты обязательны)
-        if (form.customerAddress.trim().length < 5) e.customerAddress = "Начни вводить адрес доставки.";
-        if (!(dropoff.lat && dropoff.lng && dropoff.geohash)) e.customerAddressPick = "Выбери адрес из подсказок (чтобы были координаты).";
+        if (form.customerAddress.trim().length < 5) e.customerAddress = "Укажи полный адрес доставки.";
+
+        // важно: адрес должен быть выбран из подсказок (чтобы были lat/lng)
+        if (!pickedAddress) e.customerAddressPick = "Выбери адрес из подсказок (чтобы были координаты).";
 
         if (!Number.isFinite(subtotal) || subtotal <= 0) e.orderSubtotal = "Стоимость заказа должна быть > 0 (например 100).";
         if (!Number.isFinite(fee) || fee < 0) e.deliveryFee = "Delivery fee должен быть числом (например 20).";
 
         return e;
-    }, [form, subtotal, fee, dropoff.lat, dropoff.lng, dropoff.geohash]);
+    }, [form, subtotal, fee, pickedAddress]);
 
     const canSubmit = Object.keys(errors).length === 0;
 
     const orderTotal = (Number.isFinite(subtotal) ? subtotal : 0) + (Number.isFinite(fee) ? fee : 0);
 
-    // Ключевые поля для курьера (что делать с деньгами)
     const moneyFlow = useMemo(() => {
         if (!Number.isFinite(subtotal) || !Number.isFinite(fee)) {
             return {
@@ -111,9 +108,6 @@ export function NewOrderPage() {
         }
 
         if (form.paymentType === "cash") {
-            // CASH:
-            // - курьер отдает ресторану стоимость заказа при выдаче
-            // - с клиента берет subtotal + fee
             return {
                 courierPaysAtPickup: subtotal,
                 courierCollectsFromCustomer: subtotal + fee,
@@ -121,9 +115,6 @@ export function NewOrderPage() {
             };
         }
 
-        // CARD:
-        // - курьер у клиента денег не берет
-        // - ресторан выдает курьеру fee при выдаче
         return {
             courierPaysAtPickup: 0,
             courierCollectsFromCustomer: 0,
@@ -141,36 +132,30 @@ export function NewOrderPage() {
             return;
         }
         if (!canSubmit) return;
+        if (!pickedAddress) return;
 
         setLoading(true);
         try {
-            const doc: any = {
+            const dropoffLat = pickedAddress.lat;
+            const dropoffLng = pickedAddress.lng;
+
+            const orderDoc: any = {
                 restaurantId: uid,
 
-                // клиент
                 customerName: form.customerName.trim(),
                 customerPhone: form.customerPhone.trim(),
                 customerAddress: form.customerAddress.trim(),
                 notes: form.notes.trim(),
 
-                // dropoff geo (адрес доставки)
-                dropoffLat: dropoff.lat,
-                dropoffLng: dropoff.lng,
-                dropoffGeohash: dropoff.geohash,
-                dropoffAddressText: dropoff.label ?? form.customerAddress.trim(),
-
-                // оплата
                 paymentType: form.paymentType,
                 orderSubtotal: subtotal,
                 deliveryFee: fee,
                 orderTotal,
 
-                // денежный поток для курьера (самое важное)
                 courierPaysAtPickup: moneyFlow.courierPaysAtPickup,
                 courierCollectsFromCustomer: moneyFlow.courierCollectsFromCustomer,
                 courierGetsFromRestaurantAtPickup: moneyFlow.courierGetsFromRestaurantAtPickup,
 
-                // назначение / статусы
                 status: "new",
                 assignedCourierId: null,
 
@@ -179,12 +164,24 @@ export function NewOrderPage() {
                 deliveredAt: null,
                 cancelledAt: null,
 
+                // dropoff coords (для навигатора + подбора)
+                dropoffAddressText: pickedAddress.label,
+                dropoffLat,
+                dropoffLng,
+
+                // для функций, чтобы было проще (опционально)
+                currentOfferCourierId: null,
+                offerExpiresAtMs: null,
+                offerAttempt: 0,
+                triedCourierIds: [],
+
                 createdAt: serverTimestamp(),
                 updatedAt: serverTimestamp(),
             };
 
-            await addDoc(collection(db, "orders"), doc);
+            await addDoc(collection(db, "orders"), orderDoc);
 
+            // ✅ offers создаются ТОЛЬКО Cloud Functions (чтобы не было дублей)
             navigate("/restaurant/app/orders");
         } catch (err: any) {
             setSubmitError(err?.message ?? "Failed to create order");
@@ -233,19 +230,6 @@ export function NewOrderPage() {
         return <div style={{ fontSize: 12, color: "crimson", marginTop: 4 }}>{text}</div>;
     };
 
-    function onDropoffPick(s: AddressSuggestion) {
-        const gh = geohashForLocation([s.lat, s.lng]);
-        setDropoff({ lat: s.lat, lng: s.lng, geohash: gh, label: s.label });
-        update("customerAddress", s.label);
-    }
-
-    function onDropoffTextChange(v: string) {
-        // как только пользователь начинает редактировать — сбрасываем выбранные координаты,
-        // чтобы он снова выбрал подсказку
-        setDropoff({ lat: null, lng: null, geohash: null, label: null });
-        update("customerAddress", v);
-    }
-
     return (
         <div style={{ padding: 24, maxWidth: 560, margin: "0 auto" }}>
             <div style={{ display: "flex", justifyContent: "space-between", gap: 12 }}>
@@ -286,18 +270,23 @@ export function NewOrderPage() {
                     <FieldError text={showErrors ? errors.customerPhone : undefined} />
                 </div>
 
-                {/* Delivery address with autocomplete */}
+                {/* Адрес: автокомплит */}
                 <div>
                     <AddressAutocomplete
-                        placeholder="Delivery address (start typing...)"
                         value={form.customerAddress}
-                        onChangeText={onDropoffTextChange}
-                        onPick={onDropoffPick}
-                        disabled={loading}
+                        onChangeText={(t) => {
+                            update("customerAddress", t);
+                            setPickedAddress(null); // сброс, если руками меняют текст
+                        }}
+                        onPick={(s) => {
+                            setPickedAddress(s);
+                            update("customerAddress", s.label);
+                        }}
                     />
+
                     <FieldError text={showErrors ? errors.customerAddress : undefined} />
-                    <FieldError text={showErrors ? (errors as any).customerAddressPick : undefined} />
-                    <Hint text="Важно: выбери адрес из подсказок — так мы получим координаты для навигатора курьера." />
+                    <FieldError text={showErrors ? errors.customerAddressPick : undefined} />
+                    <Hint text="Обязательно выбери адрес из подсказок — так мы получим координаты для навигатора." />
                 </div>
 
                 <hr />
@@ -358,7 +347,9 @@ export function NewOrderPage() {
                             </>
                         ) : (
                             <>
-                                <div>Курьер берет с клиента: <b>₪0.00</b></div>
+                                <div>
+                                    Курьер берет с клиента: <b>₪0.00</b>
+                                </div>
                                 <div>
                                     Ресторан выдает курьеру (доставка): <b>₪{moneyFlow.courierGetsFromRestaurantAtPickup.toFixed(2)}</b>
                                 </div>
@@ -397,9 +388,7 @@ export function NewOrderPage() {
                     {loading ? "Creating…" : "Create order"}
                 </button>
 
-                {!canSubmit && showErrors && (
-                    <div style={{ fontSize: 12, color: "crimson" }}>Исправь поля, подсвеченные красным.</div>
-                )}
+                {!canSubmit && showErrors && <div style={{ fontSize: 12, color: "crimson" }}>Исправь поля, подсвеченные красным.</div>}
 
                 {submitError && <div style={{ color: "crimson" }}>{submitError}</div>}
             </form>

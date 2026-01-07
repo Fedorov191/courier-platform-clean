@@ -1,0 +1,102 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() { return request.auth != null; }
+
+    function isRestaurant() {
+      return signedIn() && exists(/databases/$(database)/documents/restaurants/$(request.auth.uid));
+    }
+
+    function isCourier() {
+      return signedIn() && exists(/databases/$(database)/documents/couriers/$(request.auth.uid));
+    }
+
+    // Детерминированный id offer: offer_{orderId}__{courierId}
+    function offerIdFor(orderId, courierId) {
+      return "offer_" + orderId + "__" + courierId;
+    }
+
+    function hasPendingOffer(orderId, courierId) {
+      return exists(/databases/$(database)/documents/offers/$(offerIdFor(orderId, courierId)))
+        && get(/databases/$(database)/documents/offers/$(offerIdFor(orderId, courierId))).data.status == "pending";
+    }
+
+    // --- Restaurants: только свой документ ---
+    match /restaurants/{restaurantId} {
+      allow read, write: if signedIn() && request.auth.uid == restaurantId;
+    }
+
+    // --- Couriers: только свой документ ---
+    match /couriers/{courierId} {
+      allow read, write: if signedIn() && request.auth.uid == courierId;
+    }
+
+    // --- Courier public presence/location ---
+    match /courierPublic/{courierId} {
+      allow read: if signedIn() && (isRestaurant() || (isCourier() && request.auth.uid == courierId));
+      allow write: if signedIn() && isCourier() && request.auth.uid == courierId;
+    }
+
+    // --- Orders ---
+    match /orders/{orderId} {
+
+      // ресторан создаёт только свои
+      allow create: if signedIn() && isRestaurant()
+        && request.resource.data.restaurantId == request.auth.uid;
+
+      // ресторан читает только свои
+      allow read: if signedIn() && isRestaurant()
+        && resource.data.restaurantId == request.auth.uid;
+
+      // курьер читает только назначенные
+      allow read: if signedIn() && isCourier()
+        && resource.data.assignedCourierId == request.auth.uid;
+
+      // ресторан может апдейтить свой заказ (MVP)
+      allow update: if signedIn() && isRestaurant()
+        && resource.data.restaurantId == request.auth.uid;
+
+      // курьер может апдейтить заказ, если:
+      // 1) он уже назначен на него
+      // или
+      // 2) он “забирает” заказ из pending offer:
+      //    assignedCourierId: null -> uid, status -> taken
+      allow update: if signedIn() && isCourier() && (
+        (resource.data.assignedCourierId == request.auth.uid)
+        ||
+        (
+          resource.data.assignedCourierId == null
+          && hasPendingOffer(orderId, request.auth.uid)
+          && request.resource.data.assignedCourierId == request.auth.uid
+          && request.resource.data.status == "taken"
+        )
+      );
+
+      allow delete: if false;
+    }
+
+    // --- Offers ---
+    match /offers/{offerId} {
+
+      // ✅ Создание offers запрещаем клиентам полностью (только Cloud Functions)
+      allow create: if false;
+
+      // курьер читает только свои offers
+      // ресторан может читать offers своего ресторана
+      allow read: if signedIn() && (
+        (isCourier() && resource.data.courierId == request.auth.uid)
+        ||
+        (isRestaurant() && resource.data.restaurantId == request.auth.uid)
+      );
+
+      // курьер может менять статус только у своего offer и только pending->accepted/declined
+      allow update: if signedIn() && isCourier()
+        && resource.data.courierId == request.auth.uid
+        && resource.data.status == "pending"
+        && (request.resource.data.status == "accepted" || request.resource.data.status == "declined");
+
+      allow delete: if false;
+    }
+  }
+}
