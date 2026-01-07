@@ -7,14 +7,14 @@ export function AppLayout() {
 
     async function logout() {
         await signOut(auth);
-        nav("/login");
+        nav("/restaurant/login"); // было /login
     }
 
     return (
         <div style={{ padding: 24 }}>
             <header style={{ display: "flex", gap: 12, marginBottom: 16 }}>
-                <Link to="/app/orders">Orders</Link>
-                <Link to="/app/orders/new">New order</Link>
+                <Link to="/restaurant/app/orders">Orders</Link>       {/* было /app/orders */}
+                <Link to="/restaurant/app/orders/new">New order</Link> {/* было /app/orders/new */}
                 <button onClick={logout}>Logout</button>
             </header>
 
