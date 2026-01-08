@@ -7,7 +7,11 @@ import {
     where,
     limit,
     getDocs,
+    doc,
+    getDoc,
+    setDoc,
 } from "firebase/firestore";
+
 import { onAuthStateChanged } from "firebase/auth";
 import { auth, db } from "../lib/firebase";
 import { Link, useNavigate } from "react-router-dom";
@@ -57,6 +61,16 @@ export function NewOrderPage() {
         geohash: string | null;
         label: string | null;
     }>({ lat: null, lng: null, geohash: null, label: null });
+    const [pickup, setPickup] = useState<{
+        lat: number | null;
+        lng: number | null;
+        geohash: string | null;
+        label: string | null;
+    }>({ lat: null, lng: null, geohash: null, label: null });
+
+    const [pickupLoaded, setPickupLoaded] = useState(false);
+    const [pickupSaving, setPickupSaving] = useState(false);
+    const [pickupSaveError, setPickupSaveError] = useState<string>("");
 
     const [form, setForm] = useState<FormState>({
         customerName: "",
@@ -77,6 +91,41 @@ export function NewOrderPage() {
         });
         return () => unsub();
     }, []);
+    useEffect(() => {
+        let cancelled = false;
+
+        async function loadPickup() {
+            if (!uid) return;
+
+            try {
+                const snap = await getDoc(doc(db, "restaurants", uid));
+                const data: any = snap.exists() ? snap.data() : null;
+
+                const lat = data?.pickupLat ?? null;
+                const lng = data?.pickupLng ?? null;
+                const geohash =
+                    data?.pickupGeohash ??
+                    (lat && lng ? geohashForLocation([lat, lng]) : null);
+
+                const label = data?.pickupAddressText ?? data?.address ?? null;
+
+                if (!cancelled) {
+                    setPickup({ lat, lng, geohash, label });
+                    setPickupLoaded(true);
+                }
+            } catch (e: any) {
+                if (!cancelled) {
+                    setPickupLoaded(true);
+                    setPickupSaveError(e?.message ?? "Failed to load restaurant pickup location");
+                }
+            }
+        }
+
+        loadPickup();
+        return () => {
+            cancelled = true;
+        };
+    }, [uid]);
 
     const update = (key: keyof FormState, value: any) => {
         setForm((prev) => ({ ...prev, [key]: value }));
@@ -158,10 +207,20 @@ export function NewOrderPage() {
             return;
         }
         if (!canSubmit) return;
+        if (!(pickup.lat && pickup.lng && pickup.geohash)) {
+            setSubmitError("Сначала укажи pickup-адрес ресторана (из подсказок), чтобы были координаты.");
+            setLoading(false);
+            return;
+        }
 
         setLoading(true);
         try {
             const orderDoc: any = {
+                pickupLat: pickup.lat,
+                pickupLng: pickup.lng,
+                pickupGeohash: pickup.geohash,
+                pickupAddressText: pickup.label,
+
                 restaurantId: uid,
 
                 customerName: form.customerName.trim(),
@@ -204,6 +263,11 @@ export function NewOrderPage() {
             // 3) Если нашли — создаём offer
             if (courierId) {
                 await addDoc(collection(db, "offers"), {
+                    pickupLat: orderDoc.pickupLat,
+                    pickupLng: orderDoc.pickupLng,
+                    pickupGeohash: orderDoc.pickupGeohash,
+                    pickupAddressText: orderDoc.pickupAddressText,
+
                     restaurantId: uid,
                     courierId,
                     orderId: orderRef.id,
@@ -290,6 +354,45 @@ export function NewOrderPage() {
         setDropoff({ lat: s.lat, lng: s.lng, geohash: gh, label: s.label });
         update("customerAddress", s.label);
     }
+    function onPickupPick(s: AddressSuggestion) {
+        const gh = geohashForLocation([s.lat, s.lng]);
+        setPickup({ lat: s.lat, lng: s.lng, geohash: gh, label: s.label });
+        setPickupSaveError("");
+    }
+
+    function onPickupTextChange(v: string) {
+        setPickup({ lat: null, lng: null, geohash: null, label: v });
+        setPickupSaveError("");
+    }
+
+    async function savePickupToRestaurantProfile() {
+        if (!uid) return;
+
+        if (!(pickup.lat && pickup.lng && pickup.geohash)) {
+            setPickupSaveError("Выбери адрес ресторана из подсказок (нужны координаты).");
+            return;
+        }
+
+        setPickupSaving(true);
+        setPickupSaveError("");
+        try {
+            await setDoc(
+                doc(db, "restaurants", uid),
+                {
+                    pickupLat: pickup.lat,
+                    pickupLng: pickup.lng,
+                    pickupGeohash: pickup.geohash,
+                    pickupAddressText: pickup.label ?? "",
+                    updatedAt: serverTimestamp(),
+                },
+                { merge: true }
+            );
+        } catch (e: any) {
+            setPickupSaveError(e?.message ?? "Failed to save pickup location");
+        } finally {
+            setPickupSaving(false);
+        }
+    }
 
     function onDropoffTextChange(v: string) {
         setDropoff({ lat: null, lng: null, geohash: null, label: null });
@@ -315,6 +418,59 @@ export function NewOrderPage() {
             </div>
 
             <form onSubmit={onSubmit} style={{ display: "grid", gap: 12, marginTop: 16 }}>
+                {/* Restaurant pickup (required) */}
+                <div style={{ padding: 12, border: "1px solid #333", borderRadius: 12 }}>
+                    <div style={{ fontSize: 12, color: "#aaa", marginBottom: 6 }}>
+                        Restaurant pickup location
+                    </div>
+
+                    {!pickupLoaded ? (
+                        <div style={{ color: "#888", fontSize: 13 }}>Loading pickup…</div>
+                    ) : pickup.lat && pickup.lng && pickup.geohash ? (
+                        <div style={{ fontSize: 13 }}>
+                            Saved: <b>{pickup.label ?? "—"}</b>
+                        </div>
+                    ) : (
+                        <>
+                            <AddressAutocomplete
+                                placeholder="Pickup address (restaurant) — start typing..."
+                                value={pickup.label ?? ""}
+                                onChangeText={onPickupTextChange}
+                                onPick={onPickupPick}
+                                disabled={loading || pickupSaving}
+                            />
+
+                            <div style={{ height: 8 }} />
+
+                            <button
+                                type="button"
+                                onClick={savePickupToRestaurantProfile}
+                                disabled={pickupSaving}
+                                style={{
+                                    padding: "8px 12px",
+                                    borderRadius: 10,
+                                    border: "1px solid #333",
+                                    cursor: pickupSaving ? "not-allowed" : "pointer",
+                                }}
+                            >
+                                {pickupSaving ? "Saving…" : "Save pickup location"}
+                            </button>
+
+                            {pickupSaveError && (
+                                <div style={{ color: "crimson", marginTop: 8, fontSize: 12 }}>
+                                    {pickupSaveError}
+                                </div>
+                            )}
+
+                            <div style={{ color: "#888", marginTop: 8, fontSize: 12 }}>
+                                Это нужно для выбора <b>ближайшего</b> курьера к ресторану.
+                            </div>
+                        </>
+                    )}
+                </div>
+
+                <div style={{ height: 12 }} />
+
                 <div>
                     <input
                         placeholder="Customer name"

@@ -1,8 +1,12 @@
-import { useMemo, useRef, useState } from "react";
+import { useMemo, useRef, useState, type FormEvent } from "react";
+
 import { createUserWithEmailAndPassword } from "firebase/auth";
 import { doc, setDoc, serverTimestamp } from "firebase/firestore";
 import { auth, db } from "../lib/firebase";
 import { Link, useNavigate } from "react-router-dom";
+import { geohashForLocation } from "geofire-common";
+import { AddressAutocomplete } from "../components/AddressAutocomplete";
+import type { AddressSuggestion } from "../components/AddressAutocomplete";
 
 type FormState = {
     restaurantName: string;
@@ -18,7 +22,8 @@ type FormState = {
     accountHolder: string;
 };
 
-type Errors = Partial<Record<keyof FormState, string>>;
+type Errors = Partial<Record<keyof FormState, string>> & { addressPick?: string };
+
 
 function onlyDigits(s: string) {
     return s.replace(/\D/g, "");
@@ -38,6 +43,13 @@ export function SignupPage() {
     // Если да — показываем красные ошибки
     const [wasSubmitted, setWasSubmitted] = useState(false);
 
+    const [pickup, setPickup] = useState<{
+        lat: number | null;
+        lng: number | null;
+        geohash: string | null;
+        label: string | null;
+    }>({ lat: null, lng: null, geohash: null, label: null });
+
     const [form, setForm] = useState<FormState>({
         restaurantName: "",
         email: "",
@@ -51,6 +63,7 @@ export function SignupPage() {
         accountNumber: "",
         accountHolder: "",
     });
+
 
     const refs = {
         restaurantName: useRef<HTMLInputElement | null>(null),
@@ -89,6 +102,9 @@ export function SignupPage() {
         if (form.address.trim().length < 5) {
             e.address = "Укажи полный адрес (улица, дом, город).";
         }
+        if (!(pickup.lat && pickup.lng && pickup.geohash)) {
+            e.addressPick = "Выбери адрес из подсказок (чтобы были координаты).";
+        }
 
         const phoneDigits = onlyDigits(form.phone);
         if (phoneDigits.length < 9) {
@@ -119,7 +135,8 @@ export function SignupPage() {
         }
 
         return e;
-    }, [form]);
+    }, [form, pickup.lat, pickup.lng, pickup.geohash]);
+
 
     const canSubmit = Object.keys(errors).length === 0;
 
@@ -141,6 +158,16 @@ export function SignupPage() {
         if (!text) return null;
         return <div style={{ fontSize: 12, color: "crimson", marginTop: 4 }}>{text}</div>;
     };
+    function onPickupPick(s: AddressSuggestion) {
+        const gh = geohashForLocation([s.lat, s.lng]);
+        setPickup({ lat: s.lat, lng: s.lng, geohash: gh, label: s.label });
+        update("address", s.label);
+    }
+
+    function onPickupTextChange(v: string) {
+        setPickup({ lat: null, lng: null, geohash: null, label: null });
+        update("address", v);
+    }
 
     const scrollToFirstError = () => {
         const order: (keyof FormState)[] = [
@@ -168,7 +195,8 @@ export function SignupPage() {
         }
     };
 
-    const onSubmit = async (e: React.FormEvent) => {
+    const onSubmit = async (e: FormEvent) => {
+
         e.preventDefault();
         setSubmitError("");
         setWasSubmitted(true);
@@ -194,6 +222,10 @@ export function SignupPage() {
                 restaurantName: form.restaurantName.trim(),
                 address: form.address.trim(),
                 phone: form.phone.trim(),
+                pickupLat: pickup.lat,
+                pickupLng: pickup.lng,
+                pickupGeohash: pickup.geohash,
+                pickupAddressText: pickup.label ?? form.address.trim(),
 
                 billing: {
                     bankName: form.bankName.trim(),
@@ -264,16 +296,18 @@ export function SignupPage() {
                 </div>
 
                 <div>
-                    <input
-                        ref={refs.address}
-                        placeholder="Restaurant address (full)"
+                    <AddressAutocomplete
+                        placeholder="Restaurant pickup address (start typing...)"
                         value={form.address}
-                        onChange={(e) => update("address", e.target.value)}
-                        style={inputStyle(showErrors && !!errors.address)}
+                        onChangeText={onPickupTextChange}
+                        onPick={onPickupPick}
+                        disabled={loading}
                     />
-                    <Hint text="Улица, дом, город (+ этаж/вход если надо)." />
+                    <Hint text="Важно: выбери адрес из подсказок — так мы получим координаты ресторана (pickup)." />
                     <FieldError text={showErrors ? errors.address : undefined} />
+                    <FieldError text={showErrors ? errors.addressPick : undefined} />
                 </div>
+
 
                 <div>
                     <input
