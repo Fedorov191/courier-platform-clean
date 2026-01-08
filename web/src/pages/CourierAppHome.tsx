@@ -104,6 +104,8 @@ export default function CourierAppHome() {
     const user = auth.currentUser;
 
     const watchId = useRef<number | null>(null);
+    const heartbeatId = useRef<number | null>(null);
+
     const lastGeoWriteMsRef = useRef<number>(0);
     const lastGeoRef = useRef<{ lat: number; lng: number } | null>(null);
     const geoWriteInFlightRef = useRef(false);
@@ -237,6 +239,10 @@ export default function CourierAppHome() {
             navigator.geolocation.clearWatch(watchId.current);
             watchId.current = null;
         }
+        if (!next && heartbeatId.current !== null) {
+            window.clearInterval(heartbeatId.current);
+            heartbeatId.current = null;
+        }
 
         try {
             await setDoc(
@@ -264,6 +270,39 @@ export default function CourierAppHome() {
             setErr("Geolocation not supported");
             return;
         }
+// Heartbeat: обновляем lastSeenAt раз в минуту даже если позиция не меняется
+        if (heartbeatId.current !== null) {
+            window.clearInterval(heartbeatId.current);
+        }
+
+        heartbeatId.current = window.setInterval(async () => {
+            try {
+                // не чаще чем раз в минуту (на всякий случай)
+                const now = Date.now();
+                const elapsed = now - lastGeoWriteMsRef.current;
+                if (elapsed < GEO_WRITE_MIN_MS) return;
+
+                const last = lastGeoRef.current;
+                if (!last) return; // ещё нет координат — подождём первого watchPosition
+
+                if (geoWriteInFlightRef.current) return;
+                geoWriteInFlightRef.current = true;
+
+                const geohash = geohashForLocation([last.lat, last.lng]);
+
+                await setDoc(
+                    courierPublicRef,
+                    { lat: last.lat, lng: last.lng, geohash, lastSeenAt: serverTimestamp(), updatedAt: serverTimestamp() },
+                    { merge: true }
+                );
+
+                lastGeoWriteMsRef.current = now;
+            } catch {
+                // heartbeat не должен ломать UI ошибками
+            } finally {
+                geoWriteInFlightRef.current = false;
+            }
+        }, GEO_WRITE_MIN_MS);
 
         watchId.current = navigator.geolocation.watchPosition(
             async (pos) => {
@@ -274,6 +313,8 @@ export default function CourierAppHome() {
                     const now = Date.now();
                     const prev = lastGeoRef.current;
                     const moved = prev ? haversineMeters(prev.lat, prev.lng, latitude, longitude) : Infinity;
+                    lastGeoRef.current = { lat: latitude, lng: longitude };
+
                     const elapsed = now - lastGeoWriteMsRef.current;
 
                     const shouldWrite = elapsed >= GEO_WRITE_MIN_MS || moved >= GEO_MIN_MOVE_M;
