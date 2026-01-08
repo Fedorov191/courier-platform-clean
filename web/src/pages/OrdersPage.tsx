@@ -1,10 +1,22 @@
 import { useEffect, useMemo, useState } from "react";
 import { onAuthStateChanged } from "firebase/auth";
-import { collection, onSnapshot, orderBy, query, where, Timestamp } from "firebase/firestore";
+import {
+    collection,
+    onSnapshot,
+    orderBy,
+    query,
+    where,
+    Timestamp,
+    doc,
+    updateDoc,
+    serverTimestamp,
+} from "firebase/firestore";
+
 import { auth, db } from "../lib/firebase";
 import { useNavigate } from "react-router-dom";
 
-type OrderStatus = "new" | "taken" | "picked_up" | "delivered" | "cancelled";
+type OrderStatus = "new" | "offered" | "taken" | "picked_up" | "delivered" | "cancelled";
+
 type PaymentMethod = "cash" | "card";
 
 type OrderDoc = {
@@ -27,7 +39,10 @@ type OrderDoc = {
     courierGetsFromRestaurantAtPickup: number;
 
     status: OrderStatus;
+    assignedCourierId?: string | null;
+
     createdAt?: Timestamp;
+
 };
 
 function formatDate(ts?: Timestamp) {
@@ -77,6 +92,9 @@ export function OrdersPage() {
     const [loading, setLoading] = useState(true);
     const [orders, setOrders] = useState<OrderDoc[]>([]);
     const [error, setError] = useState<string>("");
+    const [tab, setTab] = useState<"active" | "completed" | "cancelled">("active");
+    const [busyAction, setBusyAction] = useState<string | null>(null); // например "cancel:orderId"
+
 
     useEffect(() => {
         const unsub = onAuthStateChanged(auth, (u) => setUid(u?.uid ?? null));
@@ -125,7 +143,9 @@ export function OrdersPage() {
                         courierGetsFromRestaurantAtPickup: Number(data.courierGetsFromRestaurantAtPickup ?? 0),
 
                         status: (data.status ?? "new") as OrderStatus,
+                        assignedCourierId: (data.assignedCourierId ?? null) as string | null,
                         createdAt: data.createdAt,
+
                     };
                 });
 
@@ -149,8 +169,65 @@ export function OrdersPage() {
         }, {} as Record<OrderStatus, number>);
         return { total, byStatus };
     }, [orders]);
+    const filteredOrders = useMemo(() => {
+        if (tab === "active") {
+            return orders.filter((o) => o.status === "new" || o.status === "offered" || o.status === "taken" || o.status === "picked_up");
+        }
+        if (tab === "completed") {
+            return orders.filter((o) => o.status === "delivered");
+        }
+        return orders.filter((o) => o.status === "cancelled");
+    }, [orders, tab]);
+
+    const counts = useMemo(() => {
+        const active =
+            (stats.byStatus.new ?? 0) +
+            ((stats.byStatus as any).offered ?? 0) +
+            (stats.byStatus.taken ?? 0) +
+            (stats.byStatus.picked_up ?? 0);
+
+        const completed = stats.byStatus.delivered ?? 0;
+        const cancelled = stats.byStatus.cancelled ?? 0;
+
+        return { active, completed, cancelled };
+    }, [stats]);
 
     const goNewOrder = () => navigate("/restaurant/app/orders/new");
+    async function cancelOrder(orderId: string) {
+        if (!window.confirm("Cancel this order?")) return;
+
+        setBusyAction(`cancel:${orderId}`);
+        try {
+            await updateDoc(doc(db, "orders", orderId), {
+                status: "cancelled",
+                cancelledAt: serverTimestamp(),
+                updatedAt: serverTimestamp(),
+            });
+        } catch (e: any) {
+            setError(e?.message ?? "Failed to cancel order");
+        } finally {
+            setBusyAction(null);
+        }
+    }
+
+    async function removeCourier(orderId: string, assignedCourierId?: string | null) {
+        if (!assignedCourierId) return;
+
+        if (!window.confirm("Remove courier from this order and reassign?")) return;
+
+        setBusyAction(`remove:${orderId}`);
+        try {
+            await updateDoc(doc(db, "orders", orderId), {
+                assignedCourierId: null,
+                status: "new",
+                updatedAt: serverTimestamp(),
+            });
+        } catch (e: any) {
+            setError(e?.message ?? "Failed to remove courier");
+        } finally {
+            setBusyAction(null);
+        }
+    }
 
     if (!uid) {
         return (
@@ -171,6 +248,29 @@ export function OrdersPage() {
                 <div>
                     <h2 style={{ margin: 0 }}>Orders</h2>
                     <div className="row row--wrap" style={{ marginTop: 8 }}>
+                        <div className="row row--wrap" style={{ marginTop: 10 }}>
+                            <button
+                                className={`btn ${tab === "active" ? "btn--primary" : "btn--ghost"}`}
+                                onClick={() => setTab("active")}
+                            >
+                                Active ({counts.active})
+                            </button>
+
+                            <button
+                                className={`btn ${tab === "completed" ? "btn--primary" : "btn--ghost"}`}
+                                onClick={() => setTab("completed")}
+                            >
+                                Completed ({counts.completed})
+                            </button>
+
+                            <button
+                                className={`btn ${tab === "cancelled" ? "btn--primary" : "btn--ghost"}`}
+                                onClick={() => setTab("cancelled")}
+                            >
+                                Cancelled ({counts.cancelled})
+                            </button>
+                        </div>
+
                         <span className="pill pill--muted">Total {stats.total}</span>
                         <span className="pill pill--info">NEW {stats.byStatus.new ?? 0}</span>
                         <span className="pill pill--warning">TAKEN {stats.byStatus.taken ?? 0}</span>
@@ -193,7 +293,7 @@ export function OrdersPage() {
             )}
 
             <div className="stack">
-                {orders.map((o) => {
+                {filteredOrders.map((o) => {
                     const isCash = o.paymentType === "cash";
 
                     return (
@@ -277,6 +377,37 @@ export function OrdersPage() {
                                         )}
                                     </div>
                                 </div>
+                                {tab === "active" && (
+                                    <div className="row row--wrap row--mobile-stack" style={{ marginTop: 12 }}>
+                                        {/* Cancel (если не delivered/cancelled) */}
+                                        {o.status !== "delivered" && o.status !== "cancelled" && (
+                                            <button
+                                                className="btn btn--danger"
+                                                onClick={() => cancelOrder(o.id)}
+                                                disabled={busyAction === `cancel:${o.id}`}
+                                            >
+                                                {busyAction === `cancel:${o.id}` ? "Cancelling…" : "Cancel order"}
+                                            </button>
+                                        )}
+
+                                        {/* Remove courier только если TAKEN и назначен courier */}
+                                        {o.status === "taken" && o.assignedCourierId && (
+                                            <button
+                                                className="btn"
+                                                onClick={() => removeCourier(o.id, o.assignedCourierId)}
+                                                disabled={busyAction === `remove:${o.id}`}
+                                            >
+                                                {busyAction === `remove:${o.id}` ? "Removing…" : "Remove courier"}
+                                            </button>
+                                        )}
+
+                                        {o.assignedCourierId && (
+                                            <span className="pill pill--muted">
+        Courier: {(o.assignedCourierId || "").slice(0, 6).toUpperCase()}
+      </span>
+                                        )}
+                                    </div>
+                                )}
 
                                 <div className="muted" style={{ marginTop: 10, fontSize: 12 }}>
                                     Created: <b>{formatDate(o.createdAt)}</b>
