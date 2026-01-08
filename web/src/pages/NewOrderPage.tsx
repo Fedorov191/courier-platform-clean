@@ -208,10 +208,30 @@ export function NewOrderPage() {
                     courierId,
                     orderId: orderRef.id,
 
-                    status: "pending", // courier accept/decline
+                    // ✅ snapshot for courier UI (so courier doesn't need to read orders)
+                    customerName: orderDoc.customerName,
+                    customerPhone: orderDoc.customerPhone,
+                    customerAddress: orderDoc.customerAddress,
+
+                    dropoffLat: orderDoc.dropoffLat,
+                    dropoffLng: orderDoc.dropoffLng,
+                    dropoffGeohash: orderDoc.dropoffGeohash,
+                    dropoffAddressText: orderDoc.dropoffAddressText,
+
+                    paymentType: orderDoc.paymentType,
+                    orderSubtotal: orderDoc.orderSubtotal,
+                    deliveryFee: orderDoc.deliveryFee,
+                    orderTotal: orderDoc.orderTotal,
+
+                    courierPaysAtPickup: orderDoc.courierPaysAtPickup,
+                    courierCollectsFromCustomer: orderDoc.courierCollectsFromCustomer,
+                    courierGetsFromRestaurantAtPickup: orderDoc.courierGetsFromRestaurantAtPickup,
+
+                    status: "pending",
                     createdAt: serverTimestamp(),
                     updatedAt: serverTimestamp(),
                 });
+
             }
 
             // 4) Возвращаемся к списку

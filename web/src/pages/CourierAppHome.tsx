@@ -18,7 +18,19 @@ type Offer = {
     id: string;
     orderId: string;
     restaurantId: string;
-    status: "pending" | "accepted" | "declined";
+    courierId: string;
+    status: string;
+
+    customerName?: string;
+    customerPhone?: string;
+    customerAddress?: string;
+
+    paymentType?: string;
+    orderSubtotal?: number;
+    deliveryFee?: number;
+    orderTotal?: number;
+
+    dropoffAddressText?: string;
 };
 
 export default function CourierAppHome() {
@@ -42,19 +54,33 @@ export default function CourierAppHome() {
 
     const [offers, setOffers] = useState<Offer[]>([]);
 
-    // --- ensure courier docs ---
+    // гарантируем документы курьера
     useEffect(() => {
-        if (!user || !courierPrivateRef || !courierPublicRef) return;
+        let cancelled = false;
 
-        setDoc(courierPrivateRef, { updatedAt: serverTimestamp() }, { merge: true });
-        setDoc(
-            courierPublicRef,
-            { courierId: user.uid, updatedAt: serverTimestamp() },
-            { merge: true }
-        );
+        async function ensureDocs() {
+            if (!user || !courierPrivateRef || !courierPublicRef) return;
+
+            try {
+                await setDoc(courierPrivateRef, { updatedAt: serverTimestamp() }, { merge: true });
+
+                await setDoc(
+                    courierPublicRef,
+                    { courierId: user.uid, updatedAt: serverTimestamp() },
+                    { merge: true }
+                );
+            } catch (e: any) {
+                if (!cancelled) setErr(e?.message ?? "Failed to init courier docs");
+            }
+        }
+
+        ensureDocs();
+        return () => {
+            cancelled = true;
+        };
     }, [user, courierPrivateRef, courierPublicRef]);
 
-    // --- subscribe to OFFERS ---
+    // подписка на offers (pending)
     useEffect(() => {
         if (!user) return;
 
@@ -64,15 +90,34 @@ export default function CourierAppHome() {
             where("status", "==", "pending")
         );
 
-        const unsub = onSnapshot(q, (snap) => {
-            const list: Offer[] = snap.docs.map((d) => ({
-                id: d.id,
-                orderId: d.data().orderId,
-                restaurantId: d.data().restaurantId,
-                status: d.data().status,
-            }));
-            setOffers(list);
-        });
+        const unsub = onSnapshot(
+            q,
+            (snap) => {
+                const list: Offer[] = snap.docs.map((d) => {
+                    const data: any = d.data();
+                    return {
+                        id: d.id,
+                        orderId: String(data.orderId ?? ""),
+                        restaurantId: String(data.restaurantId ?? ""),
+                        courierId: String(data.courierId ?? ""),
+                        status: String(data.status ?? "pending"),
+
+                        customerName: data.customerName,
+                        customerPhone: data.customerPhone,
+                        customerAddress: data.customerAddress,
+
+                        paymentType: data.paymentType,
+                        orderSubtotal: data.orderSubtotal,
+                        deliveryFee: data.deliveryFee,
+                        orderTotal: data.orderTotal,
+
+                        dropoffAddressText: data.dropoffAddressText,
+                    };
+                });
+                setOffers(list);
+            },
+            (e: any) => setErr(e?.message ?? "Failed to load offers")
+        );
 
         return () => unsub();
     }, [user]);
@@ -109,6 +154,7 @@ export default function CourierAppHome() {
             );
 
             setIsOnline(next);
+
             if (next) startTracking();
         } catch (e: any) {
             setErr(e?.message ?? "Failed to update status");
@@ -116,35 +162,47 @@ export default function CourierAppHome() {
     }
 
     function startTracking() {
-        if (!courierPublicRef || !navigator.geolocation) return;
+        if (!courierPublicRef) return;
+        if (!navigator.geolocation) {
+            setErr("Geolocation not supported");
+            return;
+        }
 
-        watchId.current = navigator.geolocation.watchPosition(async (pos) => {
-            const { latitude, longitude } = pos.coords;
-            const geohash = geohashForLocation([latitude, longitude]);
+        watchId.current = navigator.geolocation.watchPosition(
+            async (pos) => {
+                try {
+                    const { latitude, longitude } = pos.coords;
+                    const geohash = geohashForLocation([latitude, longitude]);
 
-            await setDoc(
-                courierPublicRef,
-                {
-                    lat: latitude,
-                    lng: longitude,
-                    geohash,
-                    lastSeenAt: serverTimestamp(),
-                    updatedAt: serverTimestamp(),
-                },
-                { merge: true }
-            );
-        });
+                    await setDoc(
+                        courierPublicRef,
+                        {
+                            lat: latitude,
+                            lng: longitude,
+                            geohash,
+                            lastSeenAt: serverTimestamp(),
+                            updatedAt: serverTimestamp(),
+                        },
+                        { merge: true }
+                    );
+                } catch (e: any) {
+                    setErr(e?.message ?? "Failed to update location");
+                }
+            },
+            (error) => setErr(error.message),
+            { enableHighAccuracy: true, maximumAge: 10_000, timeout: 10_000 }
+        );
     }
 
-    async function acceptOffer(offer: Offer) {
-        await updateDoc(doc(db, "offers", offer.id), {
+    async function acceptOffer(offerId: string) {
+        await updateDoc(doc(db, "offers", offerId), {
             status: "accepted",
             updatedAt: serverTimestamp(),
         });
     }
 
-    async function declineOffer(offer: Offer) {
-        await updateDoc(doc(db, "offers", offer.id), {
+    async function declineOffer(offerId: string) {
+        await updateDoc(doc(db, "offers", offerId), {
             status: "declined",
             updatedAt: serverTimestamp(),
         });
@@ -165,12 +223,12 @@ export default function CourierAppHome() {
             <h2>Courier App</h2>
 
             <div style={{ display: "flex", gap: 12, margin: "16px 0" }}>
-                <span>
-                    Status:{" "}
-                    <b style={{ color: isOnline ? "green" : "gray" }}>
-                        {isOnline ? "ONLINE" : "OFFLINE"}
-                    </b>
-                </span>
+        <span>
+          Status:{" "}
+            <b style={{ color: isOnline ? "green" : "gray" }}>
+            {isOnline ? "ONLINE" : "OFFLINE"}
+          </b>
+        </span>
 
                 <button onClick={() => setOnline(true)} disabled={isOnline}>
                     Go online
@@ -190,9 +248,7 @@ export default function CourierAppHome() {
 
             <h3>New offers</h3>
 
-            {offers.length === 0 && (
-                <p style={{ color: "#888" }}>Нет новых заказов</p>
-            )}
+            {offers.length === 0 && <p style={{ color: "#888" }}>Нет новых заказов</p>}
 
             {offers.map((o) => (
                 <div
@@ -204,15 +260,29 @@ export default function CourierAppHome() {
                         marginBottom: 10,
                     }}
                 >
-                    <div>Order: <b>{o.orderId}</b></div>
+                    <div>
+                        Order: <b>{o.orderId}</b>
+                    </div>
 
-                    <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
-                        <button onClick={() => acceptOffer(o)}>
-                            Accept
-                        </button>
-                        <button onClick={() => declineOffer(o)}>
-                            Decline
-                        </button>
+                    <div style={{ marginTop: 8, fontSize: 13 }}>
+                        <div>
+                            Customer: <b>{o.customerName ?? "—"}</b>
+                        </div>
+                        <div>
+                            Phone: <b>{o.customerPhone ?? "—"}</b>
+                        </div>
+                        <div>
+                            Address: <b>{o.dropoffAddressText ?? o.customerAddress ?? "—"}</b>
+                        </div>
+                        <div style={{ marginTop: 6, color: "#666" }}>
+                            Total: <b>{o.orderTotal ?? "—"}</b> | Fee: <b>{o.deliveryFee ?? "—"}</b> | Pay:{" "}
+                            <b>{o.paymentType ?? "—"}</b>
+                        </div>
+                    </div>
+
+                    <div style={{ display: "flex", gap: 8, marginTop: 10 }}>
+                        <button onClick={() => acceptOffer(o.id)}>Accept</button>
+                        <button onClick={() => declineOffer(o.id)}>Decline</button>
                     </div>
                 </div>
             ))}
