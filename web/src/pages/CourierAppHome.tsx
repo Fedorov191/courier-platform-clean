@@ -1,25 +1,84 @@
-import { useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { auth, db } from "../lib/firebase";
-import { doc, serverTimestamp, setDoc } from "firebase/firestore";
+import {
+    collection,
+    doc,
+    onSnapshot,
+    query,
+    serverTimestamp,
+    setDoc,
+    updateDoc,
+    where,
+} from "firebase/firestore";
 import { signOut } from "firebase/auth";
 import { useNavigate } from "react-router-dom";
 import { geohashForLocation } from "geofire-common";
 
+type Offer = {
+    id: string;
+    orderId: string;
+    restaurantId: string;
+    status: "pending" | "accepted" | "declined";
+};
+
 export default function CourierAppHome() {
     const nav = useNavigate();
     const user = auth.currentUser;
+
     const watchId = useRef<number | null>(null);
 
-    const courierRef = useMemo(() => {
+    const courierPrivateRef = useMemo(() => {
         if (!user) return null;
         return doc(db, "couriers", user.uid);
+    }, [user]);
+
+    const courierPublicRef = useMemo(() => {
+        if (!user) return null;
+        return doc(db, "courierPublic", user.uid);
     }, [user]);
 
     const [isOnline, setIsOnline] = useState(false);
     const [err, setErr] = useState<string | null>(null);
 
+    const [offers, setOffers] = useState<Offer[]>([]);
+
+    // --- ensure courier docs ---
+    useEffect(() => {
+        if (!user || !courierPrivateRef || !courierPublicRef) return;
+
+        setDoc(courierPrivateRef, { updatedAt: serverTimestamp() }, { merge: true });
+        setDoc(
+            courierPublicRef,
+            { courierId: user.uid, updatedAt: serverTimestamp() },
+            { merge: true }
+        );
+    }, [user, courierPrivateRef, courierPublicRef]);
+
+    // --- subscribe to OFFERS ---
+    useEffect(() => {
+        if (!user) return;
+
+        const q = query(
+            collection(db, "offers"),
+            where("courierId", "==", user.uid),
+            where("status", "==", "pending")
+        );
+
+        const unsub = onSnapshot(q, (snap) => {
+            const list: Offer[] = snap.docs.map((d) => ({
+                id: d.id,
+                orderId: d.data().orderId,
+                restaurantId: d.data().restaurantId,
+                status: d.data().status,
+            }));
+            setOffers(list);
+        });
+
+        return () => unsub();
+    }, [user]);
+
     async function setOnline(next: boolean) {
-        if (!courierRef || !user) return;
+        if (!user || !courierPrivateRef || !courierPublicRef) return;
         setErr(null);
 
         if (!next && watchId.current !== null) {
@@ -29,7 +88,7 @@ export default function CourierAppHome() {
 
         try {
             await setDoc(
-                courierRef,
+                courierPrivateRef,
                 {
                     isOnline: next,
                     lastSeenAt: serverTimestamp(),
@@ -38,8 +97,18 @@ export default function CourierAppHome() {
                 { merge: true }
             );
 
-            setIsOnline(next);
+            await setDoc(
+                courierPublicRef,
+                {
+                    courierId: user.uid,
+                    isOnline: next,
+                    lastSeenAt: serverTimestamp(),
+                    updatedAt: serverTimestamp(),
+                },
+                { merge: true }
+            );
 
+            setIsOnline(next);
             if (next) startTracking();
         } catch (e: any) {
             setErr(e?.message ?? "Failed to update status");
@@ -47,38 +116,38 @@ export default function CourierAppHome() {
     }
 
     function startTracking() {
-        if (!courierRef) return;
-        if (!navigator.geolocation) {
-            setErr("Geolocation not supported");
-            return;
-        }
+        if (!courierPublicRef || !navigator.geolocation) return;
 
-        watchId.current = navigator.geolocation.watchPosition(
-            async (pos) => {
-                const { latitude, longitude } = pos.coords;
-                const geohash = geohashForLocation([latitude, longitude]);
+        watchId.current = navigator.geolocation.watchPosition(async (pos) => {
+            const { latitude, longitude } = pos.coords;
+            const geohash = geohashForLocation([latitude, longitude]);
 
-                await setDoc(
-                    courierRef,
-                    {
-                        lat: latitude,
-                        lng: longitude,
-                        geohash,
-                        lastSeenAt: serverTimestamp(),
-                        updatedAt: serverTimestamp(),
-                    },
-                    { merge: true }
-                );
-            },
-            (error) => {
-                setErr(error.message);
-            },
-            {
-                enableHighAccuracy: true,
-                maximumAge: 10_000,
-                timeout: 10_000,
-            }
-        );
+            await setDoc(
+                courierPublicRef,
+                {
+                    lat: latitude,
+                    lng: longitude,
+                    geohash,
+                    lastSeenAt: serverTimestamp(),
+                    updatedAt: serverTimestamp(),
+                },
+                { merge: true }
+            );
+        });
+    }
+
+    async function acceptOffer(offer: Offer) {
+        await updateDoc(doc(db, "offers", offer.id), {
+            status: "accepted",
+            updatedAt: serverTimestamp(),
+        });
+    }
+
+    async function declineOffer(offer: Offer) {
+        await updateDoc(doc(db, "offers", offer.id), {
+            status: "declined",
+            updatedAt: serverTimestamp(),
+        });
     }
 
     async function logout() {
@@ -89,21 +158,19 @@ export default function CourierAppHome() {
         nav("/courier/login");
     }
 
-    if (!user) {
-        return <div style={{ padding: 16 }}>Not authorized</div>;
-    }
+    if (!user) return <div style={{ padding: 16 }}>Not authorized</div>;
 
     return (
         <div style={{ padding: 16, maxWidth: 520 }}>
             <h2>Courier App</h2>
 
             <div style={{ display: "flex", gap: 12, margin: "16px 0" }}>
-        <span>
-          Status:{" "}
-            <b style={{ color: isOnline ? "green" : "gray" }}>
-            {isOnline ? "ONLINE" : "OFFLINE"}
-          </b>
-        </span>
+                <span>
+                    Status:{" "}
+                    <b style={{ color: isOnline ? "green" : "gray" }}>
+                        {isOnline ? "ONLINE" : "OFFLINE"}
+                    </b>
+                </span>
 
                 <button onClick={() => setOnline(true)} disabled={isOnline}>
                     Go online
@@ -119,9 +186,36 @@ export default function CourierAppHome() {
 
             {err && <p style={{ color: "crimson" }}>{err}</p>}
 
-            <p style={{ marginTop: 12 }}>
-                Геопозиция обновляется, пока приложение открыто.
-            </p>
+            <hr />
+
+            <h3>New offers</h3>
+
+            {offers.length === 0 && (
+                <p style={{ color: "#888" }}>Нет новых заказов</p>
+            )}
+
+            {offers.map((o) => (
+                <div
+                    key={o.id}
+                    style={{
+                        border: "1px solid #333",
+                        borderRadius: 10,
+                        padding: 12,
+                        marginBottom: 10,
+                    }}
+                >
+                    <div>Order: <b>{o.orderId}</b></div>
+
+                    <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
+                        <button onClick={() => acceptOffer(o)}>
+                            Accept
+                        </button>
+                        <button onClick={() => declineOffer(o)}>
+                            Decline
+                        </button>
+                    </div>
+                </div>
+            ))}
         </div>
     );
 }

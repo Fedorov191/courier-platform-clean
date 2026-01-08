@@ -13,6 +13,7 @@ export function RoleRoute({ role }: { role: Role }) {
         if (!u) {
             setState("no-auth");
             return;
+
         }
 
         const col = role === "restaurant" ? "restaurants" : "couriers";
