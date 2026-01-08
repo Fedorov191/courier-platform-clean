@@ -22,7 +22,6 @@ type Offer = {
     courierId: string;
     status: string;
 
-    // snapshot поля (чтобы курьер видел данные без чтения orders)
     customerName?: string;
     customerPhone?: string;
     customerAddress?: string;
@@ -41,6 +40,47 @@ type Offer = {
     courierCollectsFromCustomer?: number;
     courierGetsFromRestaurantAtPickup?: number;
 };
+
+function shortId(id: string) {
+    return (id || "").slice(0, 6).toUpperCase();
+}
+
+function money(n?: number) {
+    const x = typeof n === "number" && Number.isFinite(n) ? n : 0;
+    return `₪${x.toFixed(2)}`;
+}
+
+function pillToneForOrderStatus(status?: string) {
+    switch (status) {
+        case "new":
+            return "info";
+        case "taken":
+            return "warning";
+        case "picked_up":
+            return "info";
+        case "delivered":
+            return "success";
+        case "cancelled":
+            return "danger";
+        default:
+            return "muted";
+    }
+}
+
+function labelForOrderStatus(status?: string) {
+    switch (status) {
+        case "taken":
+            return "TAKEN";
+        case "picked_up":
+            return "PICKED UP";
+        case "delivered":
+            return "DELIVERED";
+        case "new":
+            return "NEW";
+        default:
+            return (status || "—").toUpperCase();
+    }
+}
 
 export default function CourierAppHome() {
     const nav = useNavigate();
@@ -64,7 +104,10 @@ export default function CourierAppHome() {
     const [offers, setOffers] = useState<Offer[]>([]);
     const [activeOrder, setActiveOrder] = useState<any | null>(null);
 
-    // --- ensure courier docs ---
+    const [busyOfferId, setBusyOfferId] = useState<string | null>(null);
+    const [busyOrderAction, setBusyOrderAction] = useState<"pickup" | "deliver" | null>(null);
+
+    // ensure courier docs
     useEffect(() => {
         let cancelled = false;
 
@@ -72,12 +115,7 @@ export default function CourierAppHome() {
             if (!user || !courierPrivateRef || !courierPublicRef) return;
 
             try {
-                await setDoc(
-                    courierPrivateRef,
-                    { updatedAt: serverTimestamp() },
-                    { merge: true }
-                );
-
+                await setDoc(courierPrivateRef, { updatedAt: serverTimestamp() }, { merge: true });
                 await setDoc(
                     courierPublicRef,
                     { courierId: user.uid, updatedAt: serverTimestamp() },
@@ -94,7 +132,7 @@ export default function CourierAppHome() {
         };
     }, [user, courierPrivateRef, courierPublicRef]);
 
-    // --- subscribe to pending offers ---
+    // subscribe to pending offers
     useEffect(() => {
         if (!user) return;
 
@@ -144,7 +182,7 @@ export default function CourierAppHome() {
         return () => unsub();
     }, [user]);
 
-    // --- subscribe to active order (taken / picked_up) ---
+    // subscribe to active order
     useEffect(() => {
         if (!user) return;
 
@@ -174,7 +212,6 @@ export default function CourierAppHome() {
         if (!user || !courierPrivateRef || !courierPublicRef) return;
         setErr(null);
 
-        // stop tracking
         if (!next && watchId.current !== null) {
             navigator.geolocation.clearWatch(watchId.current);
             watchId.current = null;
@@ -183,27 +220,17 @@ export default function CourierAppHome() {
         try {
             await setDoc(
                 courierPrivateRef,
-                {
-                    isOnline: next,
-                    lastSeenAt: serverTimestamp(),
-                    updatedAt: serverTimestamp(),
-                },
+                { isOnline: next, lastSeenAt: serverTimestamp(), updatedAt: serverTimestamp() },
                 { merge: true }
             );
 
             await setDoc(
                 courierPublicRef,
-                {
-                    courierId: user.uid,
-                    isOnline: next,
-                    lastSeenAt: serverTimestamp(),
-                    updatedAt: serverTimestamp(),
-                },
+                { courierId: user.uid, isOnline: next, lastSeenAt: serverTimestamp(), updatedAt: serverTimestamp() },
                 { merge: true }
             );
 
             setIsOnline(next);
-
             if (next) startTracking();
         } catch (e: any) {
             setErr(e?.message ?? "Failed to update status");
@@ -225,13 +252,7 @@ export default function CourierAppHome() {
 
                     await setDoc(
                         courierPublicRef,
-                        {
-                            lat: latitude,
-                            lng: longitude,
-                            geohash,
-                            lastSeenAt: serverTimestamp(),
-                            updatedAt: serverTimestamp(),
-                        },
+                        { lat: latitude, lng: longitude, geohash, lastSeenAt: serverTimestamp(), updatedAt: serverTimestamp() },
                         { merge: true }
                     );
                 } catch (e: any) {
@@ -243,7 +264,7 @@ export default function CourierAppHome() {
         );
     }
 
-    // ✅ Вариант A: первый, кто нажал Accept — забирает заказ
+    // Accept offer (first courier wins)
     async function acceptOffer(offer: Offer) {
         if (!auth.currentUser) return;
 
@@ -252,6 +273,7 @@ export default function CourierAppHome() {
         const orderRef = doc(db, "orders", offer.orderId);
 
         setErr(null);
+        setBusyOfferId(offer.id);
 
         try {
             await runTransaction(db, async (tx) => {
@@ -260,13 +282,11 @@ export default function CourierAppHome() {
 
                 const orderData: any = orderSnap.data();
 
-                // уже взял другой курьер
                 if (orderData.assignedCourierId && orderData.assignedCourierId !== uid) {
                     tx.update(offerRef, { status: "declined", updatedAt: serverTimestamp() });
                     throw new Error("Order already taken by another courier");
                 }
 
-                // если свободен — назначаем себя
                 if (!orderData.assignedCourierId) {
                     tx.update(orderRef, {
                         assignedCourierId: uid,
@@ -276,35 +296,53 @@ export default function CourierAppHome() {
                     });
                 }
 
-                // помечаем offer accepted
                 tx.update(offerRef, { status: "accepted", updatedAt: serverTimestamp() });
             });
         } catch (e: any) {
             setErr(e?.message ?? "Failed to accept offer");
+        } finally {
+            setBusyOfferId(null);
         }
     }
 
     async function declineOffer(offerId: string) {
-        await updateDoc(doc(db, "offers", offerId), {
-            status: "declined",
-            updatedAt: serverTimestamp(),
-        });
+        setBusyOfferId(offerId);
+        try {
+            await updateDoc(doc(db, "offers", offerId), {
+                status: "declined",
+                updatedAt: serverTimestamp(),
+            });
+        } finally {
+            setBusyOfferId(null);
+        }
     }
+
     async function markPickedUp(orderId: string) {
-        await updateDoc(doc(db, "orders", orderId), {
-            status: "picked_up",
-            pickedUpAt: serverTimestamp(),
-            updatedAt: serverTimestamp(),
-        });
+        setBusyOrderAction("pickup");
+        try {
+            await updateDoc(doc(db, "orders", orderId), {
+                status: "picked_up",
+                pickedUpAt: serverTimestamp(),
+                updatedAt: serverTimestamp(),
+            });
+        } finally {
+            setBusyOrderAction(null);
+        }
     }
 
     async function markDelivered(orderId: string) {
-        await updateDoc(doc(db, "orders", orderId), {
-            status: "delivered",
-            deliveredAt: serverTimestamp(),
-            updatedAt: serverTimestamp(),
-        });
+        setBusyOrderAction("deliver");
+        try {
+            await updateDoc(doc(db, "orders", orderId), {
+                status: "delivered",
+                deliveredAt: serverTimestamp(),
+                updatedAt: serverTimestamp(),
+            });
+        } finally {
+            setBusyOrderAction(null);
+        }
     }
+
     async function logout() {
         try {
             if (isOnline) await setOnline(false);
@@ -313,124 +351,286 @@ export default function CourierAppHome() {
         nav("/courier/login");
     }
 
-    if (!user) return <div style={{ padding: 16 }}>Not authorized</div>;
+    if (!user) return <div className="page"><div className="container container--mid">Not authorized</div></div>;
+
+    const hasActive = !!activeOrder;
+    const activeStatus: string | undefined = activeOrder?.status;
+
+    const canPickup = activeStatus === "taken";
+    const canDeliver = activeStatus === "picked_up";
+
+    const activeMapUrl =
+        activeOrder?.dropoffLat && activeOrder?.dropoffLng
+            ? `https://www.google.com/maps?q=${activeOrder.dropoffLat},${activeOrder.dropoffLng}`
+            : null;
 
     return (
-        <div style={{ padding: 16, maxWidth: 520 }}>
-            <h2>Courier App</h2>
+        <div className="page">
+            <div className="container container--mid">
+                {/* Header */}
+                <div className="card">
+                    <div className="card__inner">
+                        <div className="row row--between row--wrap row--mobile-stack">
+                            <div>
+                                <div className="brand" style={{ fontSize: 22 }}>Courier Console</div>
+                                <div className="muted" style={{ marginTop: 6 }}>
+                                    Your work dashboard — offers, active order, delivery steps.
+                                </div>
+                            </div>
 
-            <div style={{ display: "flex", gap: 12, margin: "16px 0" }}>
-        <span>
-          Status:{" "}
-            <b style={{ color: isOnline ? "green" : "gray" }}>
-            {isOnline ? "ONLINE" : "OFFLINE"}
-          </b>
-        </span>
+                            <div className="row row--wrap row--mobile-stack" style={{ justifyContent: "flex-end" }}>
+                <span className={`pill ${isOnline ? "pill--success" : "pill--muted"}`}>
+                  {isOnline ? "● ONLINE" : "● OFFLINE"}
+                </span>
 
-                <button onClick={() => setOnline(true)} disabled={isOnline}>
-                    Go online
-                </button>
-                <button onClick={() => setOnline(false)} disabled={!isOnline}>
-                    Go offline
-                </button>
+                                <button className="btn btn--success" onClick={() => setOnline(true)} disabled={isOnline}>
+                                    Go online
+                                </button>
 
-                <button onClick={logout} style={{ marginLeft: "auto" }}>
-                    Logout
-                </button>
+                                <button className="btn" onClick={() => setOnline(false)} disabled={!isOnline}>
+                                    Go offline
+                                </button>
+
+                                <button className="btn btn--ghost" onClick={logout}>
+                                    Logout
+                                </button>
+                            </div>
+                        </div>
+
+                        {err && (
+                            <div className="alert alert--danger" style={{ marginTop: 12 }}>
+                                {err}
+                            </div>
+                        )}
+                    </div>
+                </div>
+
+                {/* Active order */}
+                <div style={{ height: 12 }} />
+
+                {activeOrder && (
+                    <div className="card">
+                        <div className="card__inner">
+                            <div className="row row--between row--wrap">
+                                <div className="row row--wrap">
+                                    <div style={{ fontWeight: 950, fontSize: 16 }}>
+                                        Active order <span className="mono">#{shortId(activeOrder.id)}</span>
+                                    </div>
+                                    <span className={`pill pill--${pillToneForOrderStatus(activeOrder.status)}`}>
+                    {labelForOrderStatus(activeOrder.status)}
+                  </span>
+                                </div>
+
+                                <div className="row row--wrap">
+                                    {/* step pills */}
+                                    <span className={`pill ${activeStatus === "taken" ? "pill--warning" : "pill--success"}`}>
+                    1 · TAKEN
+                  </span>
+                                    <span className={`pill ${activeStatus === "picked_up" ? "pill--info" : "pill--muted"}`}>
+                    2 · PICKED UP
+                  </span>
+                                    <span className="pill pill--muted">3 · DELIVERED</span>
+                                </div>
+                            </div>
+
+                            <div className="hr" />
+
+                            <div className="subcard">
+                                <div className="kv">
+                                    <div className="line">
+                                        <span>Customer</span>
+                                        <b>{activeOrder.customerName ?? "—"}</b>
+                                    </div>
+
+                                    <div className="line">
+                                        <span>Phone</span>
+                                        <b>
+                                            {activeOrder.customerPhone ? (
+                                                <a href={`tel:${activeOrder.customerPhone}`} style={{ textDecoration: "none" }}>
+                                                    {activeOrder.customerPhone}
+                                                </a>
+                                            ) : (
+                                                "—"
+                                            )}
+                                        </b>
+                                    </div>
+
+                                    <div className="line" style={{ alignItems: "baseline" }}>
+                                        <span>Address</span>
+                                        <b style={{ textAlign: "right" }}>
+                                            {activeOrder.dropoffAddressText ?? activeOrder.customerAddress ?? "—"}
+                                        </b>
+                                    </div>
+
+                                    <div className="line">
+                                        <span>Total</span>
+                                        <b>{money(activeOrder.orderTotal)}</b>
+                                    </div>
+
+                                    <div className="line">
+                                        <span>Your fee</span>
+                                        <b>{money(activeOrder.deliveryFee)}</b>
+                                    </div>
+
+                                    <div className="line">
+                                        <span>Pay</span>
+                                        <b>{activeOrder.paymentType ?? "—"}</b>
+                                    </div>
+                                </div>
+                            </div>
+
+                            <div style={{ height: 12 }} />
+
+                            <div className="row row--wrap row--mobile-stack">
+                                <button
+                                    className="btn btn--primary"
+                                    onClick={() => markPickedUp(activeOrder.id)}
+                                    disabled={!canPickup || busyOrderAction !== null}
+                                >
+                                    {busyOrderAction === "pickup" ? "Saving…" : "Picked up"}
+                                </button>
+
+                                <button
+                                    className="btn btn--success"
+                                    onClick={() => markDelivered(activeOrder.id)}
+                                    disabled={!canDeliver || busyOrderAction !== null}
+                                >
+                                    {busyOrderAction === "deliver" ? "Saving…" : "Delivered"}
+                                </button>
+
+                                {activeMapUrl && (
+                                    <a className="btn btn--ghost" href={activeMapUrl} target="_blank" rel="noreferrer">
+                                        Open map
+                                    </a>
+                                )}
+                            </div>
+
+                            {!canDeliver && (
+                                <div className="muted" style={{ marginTop: 10, fontSize: 13 }}>
+                                    Tip: “Delivered” becomes available after “Picked up”.
+                                </div>
+                            )}
+                        </div>
+                    </div>
+                )}
+
+                {/* Offers */}
+                <div style={{ height: 12 }} />
+
+                <div className="card">
+                    <div className="card__inner">
+                        <div className="row row--between row--wrap">
+                            <div className="row row--wrap">
+                                <h3 style={{ margin: 0 }}>New offers</h3>
+                                <span className="pill pill--muted">{offers.length}</span>
+                            </div>
+
+                            {hasActive && (
+                                <span className="pill pill--warning">
+                  Finish active order to accept new ones
+                </span>
+                            )}
+                        </div>
+
+                        <div className="hr" />
+
+                        {offers.length === 0 && <div className="muted">No new offers</div>}
+
+                        <div className="stack">
+                            {offers.map((o) => {
+                                const offerMapUrl =
+                                    o.dropoffLat && o.dropoffLng
+                                        ? `https://www.google.com/maps?q=${o.dropoffLat},${o.dropoffLng}`
+                                        : null;
+
+                                const isBusy = busyOfferId === o.id;
+
+                                return (
+                                    <div key={o.id} className="subcard">
+                                        <div className="row row--between row--wrap">
+                                            <div className="row row--wrap">
+                                                <div style={{ fontWeight: 950 }}>
+                                                    Order <span className="mono">#{shortId(o.orderId)}</span>
+                                                </div>
+
+                                                <span className={`pill ${o.paymentType === "cash" ? "pill--muted" : "pill--info"}`}>
+                          {(o.paymentType ?? "—").toUpperCase()}
+                        </span>
+
+                                                <span className="pill pill--success">Fee {money(o.deliveryFee)}</span>
+                                            </div>
+
+                                            {offerMapUrl && (
+                                                <a className="btn btn--ghost" href={offerMapUrl} target="_blank" rel="noreferrer">
+                                                    Map
+                                                </a>
+                                            )}
+                                        </div>
+
+                                        <div style={{ height: 10 }} />
+
+                                        <div className="kv">
+                                            <div className="line">
+                                                <span>Customer</span>
+                                                <b>{o.customerName ?? "—"}</b>
+                                            </div>
+
+                                            <div className="line">
+                                                <span>Phone</span>
+                                                <b>
+                                                    {o.customerPhone ? (
+                                                        <a href={`tel:${o.customerPhone}`} style={{ textDecoration: "none" }}>
+                                                            {o.customerPhone}
+                                                        </a>
+                                                    ) : (
+                                                        "—"
+                                                    )}
+                                                </b>
+                                            </div>
+
+                                            <div className="line" style={{ alignItems: "baseline" }}>
+                                                <span>Address</span>
+                                                <b style={{ textAlign: "right" }}>
+                                                    {o.dropoffAddressText ?? o.customerAddress ?? "—"}
+                                                </b>
+                                            </div>
+
+                                            <div className="line">
+                                                <span>Total</span>
+                                                <b>{money(o.orderTotal)}</b>
+                                            </div>
+                                        </div>
+
+                                        <div style={{ height: 12 }} />
+
+                                        <div className="row row--wrap row--mobile-stack">
+                                            <button
+                                                className="btn btn--success"
+                                                onClick={() => acceptOffer(o)}
+                                                disabled={isBusy || hasActive}
+                                            >
+                                                {isBusy ? "Working…" : "Accept"}
+                                            </button>
+
+                                            <button
+                                                className="btn btn--danger"
+                                                onClick={() => declineOffer(o.id)}
+                                                disabled={isBusy}
+                                            >
+                                                {isBusy ? "Working…" : "Decline"}
+                                            </button>
+                                        </div>
+                                    </div>
+                                );
+                            })}
+                        </div>
+
+                        <div className="muted" style={{ marginTop: 12, fontSize: 12 }}>
+                            Presence updates while the app is open.
+                        </div>
+                    </div>
+                </div>
             </div>
-
-            {err && <p style={{ color: "crimson" }}>{err}</p>}
-
-            {activeOrder && (
-                <div
-                    style={{
-                        border: "1px solid #333",
-                        borderRadius: 10,
-                        padding: 12,
-                        marginBottom: 12,
-                    }}
-                >
-                    <h3 style={{ marginTop: 0 }}>Active order</h3>
-                    <div>
-                        Order: <b>{activeOrder.id}</b>
-                    </div>
-                    <div>
-                        Customer: <b>{activeOrder.customerName ?? "—"}</b>
-                    </div>
-                    <div>
-                        Phone: <b>{activeOrder.customerPhone ?? "—"}</b>
-                    </div>
-                    <div>
-                        Address:{" "}
-                        <b>
-                            {activeOrder.dropoffAddressText ??
-                                activeOrder.customerAddress ??
-                                "—"}
-                        </b>
-                    </div>
-                    <div style={{ marginTop: 6, color: "#666" }}>
-                        Total: <b>{activeOrder.orderTotal ?? "—"}</b> | Fee:{" "}
-                        <b>{activeOrder.deliveryFee ?? "—"}</b> | Pay:{" "}
-                        <b>{activeOrder.paymentType ?? "—"}</b>
-                    </div>
-                    <div style={{ display: "flex", gap: 8, marginTop: 10 }}>
-                        <button onClick={() => markPickedUp(activeOrder.id)}>
-                            Picked up
-                        </button>
-
-                        <button onClick={() => markDelivered(activeOrder.id)}>
-                            Delivered
-                        </button>
-                    </div>
-
-                </div>
-
-            )}
-
-            <hr />
-
-            <h3>New offers</h3>
-
-            {offers.length === 0 && <p style={{ color: "#888" }}>Нет новых заказов</p>}
-
-            {offers.map((o) => (
-                <div
-                    key={o.id}
-                    style={{
-                        border: "1px solid #333",
-                        borderRadius: 10,
-                        padding: 12,
-                        marginBottom: 10,
-                    }}
-                >
-                    <div>
-                        Order: <b>{o.orderId}</b>
-                    </div>
-
-                    <div style={{ marginTop: 8, fontSize: 13 }}>
-                        <div>
-                            Customer: <b>{o.customerName ?? "—"}</b>
-                        </div>
-                        <div>
-                            Phone: <b>{o.customerPhone ?? "—"}</b>
-                        </div>
-                        <div>
-                            Address:{" "}
-                            <b>{o.dropoffAddressText ?? o.customerAddress ?? "—"}</b>
-                        </div>
-
-                        <div style={{ marginTop: 6, color: "#666" }}>
-                            Total: <b>{o.orderTotal ?? "—"}</b> | Fee:{" "}
-                            <b>{o.deliveryFee ?? "—"}</b> | Pay: <b>{o.paymentType ?? "—"}</b>
-                        </div>
-                    </div>
-
-                    <div style={{ display: "flex", gap: 8, marginTop: 10 }}>
-                        <button onClick={() => acceptOffer(o)}>Accept</button>
-                        <button onClick={() => declineOffer(o.id)}>Decline</button>
-                    </div>
-                </div>
-            ))}
         </div>
     );
 }

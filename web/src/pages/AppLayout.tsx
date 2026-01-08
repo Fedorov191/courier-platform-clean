@@ -1,4 +1,4 @@
-import { Link, Outlet, useNavigate } from "react-router-dom";
+import { NavLink, Outlet, useNavigate } from "react-router-dom";
 import { signOut } from "firebase/auth";
 import { auth } from "../lib/firebase";
 
@@ -10,15 +10,37 @@ export function AppLayout() {
         nav("/restaurant/login");
     }
 
-    return (
-        <div style={{ padding: 24 }}>
-            <header style={{ display: "flex", gap: 12, marginBottom: 16 }}>
-                <Link to="/restaurant/app/orders">Orders</Link>
-                <Link to="/restaurant/app/orders/new">New order</Link>
-                <button onClick={logout}>Logout</button>
-            </header>
+    const linkClass = ({ isActive }: { isActive: boolean }) =>
+        `navlink ${isActive ? "is-active" : ""}`;
 
-            <Outlet />
+    return (
+        <div className="page">
+            <div className="container">
+                <header className="card">
+                    <div className="card__inner">
+                        <div className="topnav">
+                            <div className="row row--wrap">
+                                <div className="brand">Restaurant Console</div>
+                                <nav className="navlinks">
+                                    <NavLink to="/restaurant/app/orders" className={linkClass}>
+                                        Orders
+                                    </NavLink>
+                                    <NavLink to="/restaurant/app/orders/new" className={linkClass}>
+                                        New order
+                                    </NavLink>
+                                </nav>
+                            </div>
+
+                            <button className="btn btn--ghost" onClick={logout}>
+                                Logout
+                            </button>
+                        </div>
+                    </div>
+                </header>
+
+                <div style={{ height: 12 }} />
+                <Outlet />
+            </div>
         </div>
     );
 }

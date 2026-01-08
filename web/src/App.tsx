@@ -1,3 +1,5 @@
+import "./ui.css";
+
 import { Navigate, Route, Routes } from "react-router-dom";
 import { HomePage } from "./pages/HomePage";
 
@@ -43,7 +45,6 @@ export default function App() {
             </Route>
 
             {/* =================== LEGACY REDIRECTS (важно!) =================== */}
-            {/* Старые пути направляем в ресторанную зону, чтобы текущий код (nav("/app")) не ломался */}
             <Route path="/login" element={<Navigate to="/restaurant/login" replace />} />
             <Route path="/signup" element={<Navigate to="/restaurant/signup" replace />} />
             <Route path="/app/*" element={<Navigate to="/restaurant/app" replace />} />

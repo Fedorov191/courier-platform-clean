@@ -4,7 +4,7 @@ import { collection, onSnapshot, orderBy, query, where, Timestamp } from "fireba
 import { auth, db } from "../lib/firebase";
 import { useNavigate } from "react-router-dom";
 
-type OrderStatus = "new" | "taken" | "delivered" | "cancelled";
+type OrderStatus = "new" | "taken" | "picked_up" | "delivered" | "cancelled";
 type PaymentMethod = "cash" | "card";
 
 type OrderDoc = {
@@ -22,7 +22,6 @@ type OrderDoc = {
     deliveryFee: number;
     orderTotal: number;
 
-    // Денежная логика (как в NewOrderPage):
     courierPaysAtPickup: number;
     courierCollectsFromCustomer: number;
     courierGetsFromRestaurantAtPickup: number;
@@ -33,27 +32,37 @@ type OrderDoc = {
 
 function formatDate(ts?: Timestamp) {
     if (!ts) return "—";
-    const d = ts.toDate();
-    return d.toLocaleString();
+    return ts.toDate().toLocaleString();
 }
 
 function statusLabel(s: OrderStatus) {
     switch (s) {
-        case "new":
-            return "NEW";
-        case "taken":
-            return "TAKEN";
-        case "delivered":
-            return "DELIVERED";
-        case "cancelled":
-            return "CANCELLED";
-        default:
-            return s;
+        case "new": return "NEW";
+        case "taken": return "TAKEN";
+        case "picked_up": return "PICKED UP";
+        case "delivered": return "DELIVERED";
+        case "cancelled": return "CANCELLED";
+        default: return s;
+    }
+}
+
+function statusTone(s: OrderStatus) {
+    switch (s) {
+        case "new": return "info";
+        case "taken": return "warning";
+        case "picked_up": return "info";
+        case "delivered": return "success";
+        case "cancelled": return "danger";
+        default: return "muted";
     }
 }
 
 function paymentLabel(p: PaymentMethod) {
     return p === "cash" ? "CASH" : "CARD";
+}
+
+function paymentTone(p: PaymentMethod) {
+    return p === "cash" ? "muted" : "info";
 }
 
 function money(n: number) {
@@ -70,9 +79,7 @@ export function OrdersPage() {
     const [error, setError] = useState<string>("");
 
     useEffect(() => {
-        const unsub = onAuthStateChanged(auth, (u) => {
-            setUid(u?.uid ?? null);
-        });
+        const unsub = onAuthStateChanged(auth, (u) => setUid(u?.uid ?? null));
         return () => unsub();
     }, []);
 
@@ -98,7 +105,6 @@ export function OrdersPage() {
             (snap) => {
                 const list: OrderDoc[] = snap.docs.map((d) => {
                     const data = d.data() as any;
-
                     return {
                         id: d.id,
                         restaurantId: data.restaurantId,
@@ -144,185 +150,136 @@ export function OrdersPage() {
         return { total, byStatus };
     }, [orders]);
 
-    const goNewOrder = () => {
-        // ✅ ВАЖНО: новая ресторанная зона
-        navigate("/restaurant/app/orders/new");
-    };
+    const goNewOrder = () => navigate("/restaurant/app/orders/new");
 
     if (!uid) {
         return (
-            <div style={{ padding: 24 }}>
-                <h2>Orders</h2>
-                <div style={{ color: "crimson" }}>Нет авторизации. Перейди на логин.</div>
+            <div className="card">
+                <div className="card__inner">
+                    <h2 style={{ margin: 0 }}>Orders</h2>
+                    <div className="alert alert--danger" style={{ marginTop: 12 }}>
+                        No auth session. Please login.
+                    </div>
+                </div>
             </div>
         );
     }
 
     return (
-        <div style={{ padding: 24, maxWidth: 980 }}>
-            <div
-                style={{
-                    display: "flex",
-                    alignItems: "center",
-                    justifyContent: "space-between",
-                    gap: 12,
-                    marginBottom: 16,
-                }}
-            >
+        <div className="stack">
+            <div className="row row--between row--wrap row--mobile-stack">
                 <div>
                     <h2 style={{ margin: 0 }}>Orders</h2>
-                    <div style={{ fontSize: 12, color: "#888", marginTop: 4 }}>
-                        Total: {stats.total} · NEW: {stats.byStatus.new ?? 0} · TAKEN: {stats.byStatus.taken ?? 0} · DELIVERED:{" "}
-                        {stats.byStatus.delivered ?? 0}
+                    <div className="row row--wrap" style={{ marginTop: 8 }}>
+                        <span className="pill pill--muted">Total {stats.total}</span>
+                        <span className="pill pill--info">NEW {stats.byStatus.new ?? 0}</span>
+                        <span className="pill pill--warning">TAKEN {stats.byStatus.taken ?? 0}</span>
+                        <span className="pill pill--success">DELIVERED {stats.byStatus.delivered ?? 0}</span>
                     </div>
                 </div>
 
-                <button
-                    onClick={goNewOrder}
-                    style={{
-                        padding: "10px 14px",
-                        borderRadius: 10,
-                        border: "1px solid #333",
-                        cursor: "pointer",
-                    }}
-                >
+                <button className="btn btn--primary" onClick={goNewOrder}>
                     + New order
                 </button>
             </div>
 
-            {loading && <div>Loading…</div>}
-            {error && <div style={{ color: "crimson" }}>{error}</div>}
+            {loading && <div className="muted">Loading…</div>}
+            {error && <div className="alert alert--danger">{error}</div>}
 
             {!loading && !error && orders.length === 0 && (
-                <div style={{ color: "#888" }}>
-                    Пока заказов нет. Нажми <b>+ New order</b>.
+                <div className="muted">
+                    No orders yet. Click <b>+ New order</b>.
                 </div>
             )}
 
-            <div style={{ display: "grid", gap: 12, marginTop: 12 }}>
+            <div className="stack">
                 {orders.map((o) => {
                     const isCash = o.paymentType === "cash";
 
                     return (
-                        <div
-                            key={o.id}
-                            style={{
-                                border: "1px solid #333",
-                                borderRadius: 12,
-                                padding: 14,
-                                display: "grid",
-                                gap: 8,
-                            }}
-                        >
-                            {/* Header */}
-                            <div
-                                style={{
-                                    display: "flex",
-                                    justifyContent: "space-between",
-                                    alignItems: "baseline",
-                                    gap: 12,
-                                }}
-                            >
-                                <div style={{ fontWeight: 700 }}>Order #{o.id.slice(0, 6).toUpperCase()}</div>
-
-                                <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
-                                    <div style={{ fontSize: 12, padding: "4px 8px", borderRadius: 999, border: "1px solid #555" }}>
-                                        {paymentLabel(o.paymentType)}
+                        <div key={o.id} className="card">
+                            <div className="card__inner">
+                                <div className="row row--between row--wrap">
+                                    <div style={{ fontWeight: 950 }}>
+                                        Order <span className="mono">#{o.id.slice(0, 6).toUpperCase()}</span>
                                     </div>
 
-                                    <div style={{ fontSize: 12, padding: "4px 8px", borderRadius: 999, border: "1px solid #555" }}>
-                                        {statusLabel(o.status)}
+                                    <div className="row row--wrap">
+                    <span className={`pill pill--${paymentTone(o.paymentType)}`}>
+                      {paymentLabel(o.paymentType)}
+                    </span>
+                                        <span className={`pill pill--${statusTone(o.status)}`}>
+                      {statusLabel(o.status)}
+                    </span>
                                     </div>
                                 </div>
-                            </div>
 
-                            {/* Customer */}
-                            <div style={{ fontSize: 14 }}>
-                                <b>Customer:</b> {o.customerName || "—"}
-                            </div>
+                                <div className="hr" />
 
-                            <div style={{ fontSize: 14 }}>
-                                <b>Address:</b> {o.customerAddress || "—"}
-                            </div>
+                                <div className="subcard">
+                                    <div className="kv">
+                                        <div className="line">
+                                            <span>Customer</span>
+                                            <b>{o.customerName || "—"}</b>
+                                        </div>
 
-                            {o.customerPhone && (
-                                <div style={{ fontSize: 14 }}>
-                                    <b>Phone:</b> {o.customerPhone}
+                                        <div className="line" style={{ alignItems: "baseline" }}>
+                                            <span>Address</span>
+                                            <b style={{ textAlign: "right" }}>{o.customerAddress || "—"}</b>
+                                        </div>
+
+                                        {o.customerPhone && (
+                                            <div className="line">
+                                                <span>Phone</span>
+                                                <b>{o.customerPhone}</b>
+                                            </div>
+                                        )}
+
+                                        <div className="line">
+                                            <span>Subtotal</span>
+                                            <b>{money(o.orderSubtotal)}</b>
+                                        </div>
+
+                                        <div className="line">
+                                            <span>Delivery fee</span>
+                                            <b>{money(o.deliveryFee)}</b>
+                                        </div>
+
+                                        <div className="line">
+                                            <span>Total</span>
+                                            <b>{money(o.orderTotal)}</b>
+                                        </div>
+
+                                        <div className="hr" />
+
+                                        {isCash ? (
+                                            <>
+                                                <div className="line">
+                                                    <span>Courier pays restaurant</span>
+                                                    <b>{money(o.courierPaysAtPickup)}</b>
+                                                </div>
+                                                <div className="line">
+                                                    <span>Courier collects from customer</span>
+                                                    <b>{money(o.courierCollectsFromCustomer)}</b>
+                                                </div>
+                                            </>
+                                        ) : (
+                                            <>
+                                                <div className="line">
+                                                    <span>Courier collects from customer</span>
+                                                    <b>₪0.00</b>
+                                                </div>
+                                                <div className="line">
+                                                    <span>Restaurant pays courier</span>
+                                                    <b>{money(o.courierGetsFromRestaurantAtPickup)}</b>
+                                                </div>
+                                            </>
+                                        )}
+                                    </div>
                                 </div>
-                            )}
 
-                            {o.notes && (
-                                <div style={{ fontSize: 13, color: "#aaa" }}>
-                                    <b>Note:</b> {o.notes}
-                                </div>
-                            )}
-
-                            {/* Money block */}
-                            <div
-                                style={{
-                                    padding: 12,
-                                    border: "1px dashed #555",
-                                    borderRadius: 12,
-                                    display: "grid",
-                                    gap: 6,
-                                }}
-                            >
-                                <div style={{ display: "flex", justifyContent: "space-between" }}>
-                                    <span style={{ color: "#aaa" }}>Subtotal</span>
-                                    <b>{money(o.orderSubtotal)}</b>
-                                </div>
-
-                                <div style={{ display: "flex", justifyContent: "space-between" }}>
-                                    <span style={{ color: "#aaa" }}>Delivery fee</span>
-                                    <b>{money(o.deliveryFee)}</b>
-                                </div>
-
-                                <div style={{ display: "flex", justifyContent: "space-between" }}>
-                                    <span style={{ color: "#aaa" }}>Total</span>
-                                    <b>{money(o.orderTotal)}</b>
-                                </div>
-
-                                <hr style={{ borderColor: "#333", width: "100%" }} />
-
-                                {isCash ? (
-                                    <>
-                                        <div style={{ display: "flex", justifyContent: "space-between" }}>
-                                            <span style={{ color: "#aaa" }}>Courier pays restaurant at pickup</span>
-                                            <b>{money(o.courierPaysAtPickup)}</b>
-                                        </div>
-
-                                        <div style={{ display: "flex", justifyContent: "space-between" }}>
-                                            <span style={{ color: "#aaa" }}>Courier collects from customer</span>
-                                            <b>{money(o.courierCollectsFromCustomer)}</b>
-                                        </div>
-
-                                        <div style={{ fontSize: 12, color: "#888", marginTop: 4 }}>
-                                            Rule: CASH → courier pays <b>subtotal</b> to restaurant at pickup; collects <b>subtotal+fee</b> from customer.
-                                        </div>
-                                    </>
-                                ) : (
-                                    <>
-                                        <div style={{ display: "flex", justifyContent: "space-between" }}>
-                                            <span style={{ color: "#aaa" }}>Courier collects from customer</span>
-                                            <b>₪0.00</b>
-                                        </div>
-
-                                        <div style={{ display: "flex", justifyContent: "space-between" }}>
-                                            <span style={{ color: "#aaa" }}>Restaurant pays courier at pickup</span>
-                                            <b>{money(o.courierGetsFromRestaurantAtPickup)}</b>
-                                        </div>
-
-                                        <div style={{ fontSize: 12, color: "#888", marginTop: 4 }}>
-                                            Rule: CARD → customer already paid; courier gets <b>fee</b> from restaurant at pickup.
-                                        </div>
-                                    </>
-                                )}
-                            </div>
-
-                            {/* Footer */}
-                            <div style={{ display: "flex", justifyContent: "space-between", marginTop: 2, color: "#aaa", fontSize: 12 }}>
-                                <div>
-                                    <b>Created:</b> {formatDate(o.createdAt)}
+                                <div className="muted" style={{ marginTop: 10, fontSize: 12 }}>
+                                    Created: <b>{formatDate(o.createdAt)}</b>
                                 </div>
                             </div>
                         </div>
