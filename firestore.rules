@@ -1,0 +1,88 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() { return request.auth != null; }
+
+    function isRestaurant() {
+      return signedIn() && exists(/databases/$(database)/documents/restaurants/$(request.auth.uid));
+    }
+
+    function isCourier() {
+      return signedIn() && exists(/databases/$(database)/documents/couriers/$(request.auth.uid));
+    }
+
+    // --- Restaurants: только свой документ ---
+    match /restaurants/{restaurantId} {
+      allow read, write: if signedIn() && request.auth.uid == restaurantId;
+    }
+
+    // --- Couriers: только свой документ ---
+    match /couriers/{courierId} {
+      allow read, write: if signedIn() && request.auth.uid == courierId;
+    }
+
+    // --- Courier public presence/location (для подбора) ---
+    match /courierPublic/{courierId} {
+      allow read: if signedIn() && (isRestaurant() || (isCourier() && request.auth.uid == courierId));
+      allow write: if signedIn() && isCourier() && request.auth.uid == courierId;
+    }
+
+   // --- Orders ---
+match /orders/{orderId} {
+
+  // CREATE: только ресторан создаёт заказ для себя
+  allow create: if signedIn()
+    && isRestaurant()
+    && request.resource.data.restaurantId == request.auth.uid
+    // (опционально) при создании заказ не должен быть "назначен" на курьера
+    && (
+      !("assignedCourierId" in request.resource.data)
+      || request.resource.data.assignedCourierId == null
+    );
+
+  // READ (как было)
+  allow read: if signedIn() && (
+    (isRestaurant() && resource.data.restaurantId == request.auth.uid)
+    ||
+    (isCourier() && (
+      resource.data.assignedCourierId == request.auth.uid
+      || resource.data.assignedCourierId == null
+    ))
+  );
+
+  // UPDATE (как было)
+  allow update: if signedIn() && (
+    (isRestaurant() && resource.data.restaurantId == request.auth.uid)
+    ||
+    (isCourier() && (
+      (
+        resource.data.assignedCourierId == null &&
+        request.resource.data.assignedCourierId == request.auth.uid
+      )
+      ||
+      (resource.data.assignedCourierId == request.auth.uid)
+    ))
+  );
+
+  allow delete: if false;
+}
+
+
+    // --- Offers ---
+    match /offers/{offerId} {
+      allow create: if signedIn() && isRestaurant() && request.resource.data.restaurantId == request.auth.uid;
+
+      allow read: if signedIn() && (
+        (isCourier() && resource.data.courierId == request.auth.uid)
+        ||
+        (isRestaurant() && resource.data.restaurantId == request.auth.uid)
+      );
+
+      // ✅ курьер может менять статус только своего offer (accept/decline)
+      allow update: if signedIn() && isCourier() && resource.data.courierId == request.auth.uid;
+
+      allow delete: if false;
+    }
+  }
+}

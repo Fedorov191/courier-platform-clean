@@ -49,6 +49,23 @@ function money(n?: number) {
     const x = typeof n === "number" && Number.isFinite(n) ? n : 0;
     return `₪${x.toFixed(2)}`;
 }
+const MAX_ACTIVE_ORDERS = 3;
+const MAX_PENDING_OFFERS = 3;
+
+const GEO_WRITE_MIN_MS = 60_000;   // пишем в Firestore не чаще 1 раза/мин
+const GEO_MIN_MOVE_M = 150;        // или если сдвиг > 150 метров
+
+function haversineMeters(lat1: number, lon1: number, lat2: number, lon2: number) {
+    const R = 6371000;
+    const toRad = (d: number) => (d * Math.PI) / 180;
+    const dLat = toRad(lat2 - lat1);
+    const dLon = toRad(lon2 - lon1);
+    const a =
+        Math.sin(dLat / 2) ** 2 +
+        Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon / 2) ** 2;
+    const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+    return R * c;
+}
 
 function pillToneForOrderStatus(status?: string) {
     switch (status) {
@@ -87,6 +104,9 @@ export default function CourierAppHome() {
     const user = auth.currentUser;
 
     const watchId = useRef<number | null>(null);
+    const lastGeoWriteMsRef = useRef<number>(0);
+    const lastGeoRef = useRef<{ lat: number; lng: number } | null>(null);
+    const geoWriteInFlightRef = useRef(false);
 
     const courierPrivateRef = useMemo(() => {
         if (!user) return null;
@@ -102,7 +122,7 @@ export default function CourierAppHome() {
     const [err, setErr] = useState<string | null>(null);
 
     const [offers, setOffers] = useState<Offer[]>([]);
-    const [activeOrder, setActiveOrder] = useState<any | null>(null);
+    const [activeOrders, setActiveOrders] = useState<any[]>([]);
 
     const [busyOfferId, setBusyOfferId] = useState<string | null>(null);
     const [busyOrderAction, setBusyOrderAction] = useState<"pickup" | "deliver" | null>(null);
@@ -182,7 +202,7 @@ export default function CourierAppHome() {
         return () => unsub();
     }, [user]);
 
-    // subscribe to active order
+    // subscribe to active orders
     useEffect(() => {
         if (!user) return;
 
@@ -195,22 +215,23 @@ export default function CourierAppHome() {
         const unsub = onSnapshot(
             q,
             (snap) => {
-                if (snap.empty) {
-                    setActiveOrder(null);
-                    return;
-                }
-                const d = snap.docs[0];
-                setActiveOrder({ id: d.id, ...d.data() });
+                const list = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+                setActiveOrders(list);
             },
-            (e: any) => setErr(e?.message ?? "Failed to load active order")
+            (e: any) => setErr(e?.message ?? "Failed to load active orders")
         );
 
         return () => unsub();
     }, [user]);
 
+
     async function setOnline(next: boolean) {
         if (!user || !courierPrivateRef || !courierPublicRef) return;
         setErr(null);
+        if (!next && activeOrders.length > 0) {
+            setErr("You can't go OFFLINE while you have active orders.");
+            return;
+        }
 
         if (!next && watchId.current !== null) {
             navigator.geolocation.clearWatch(watchId.current);
@@ -250,11 +271,27 @@ export default function CourierAppHome() {
                     const { latitude, longitude } = pos.coords;
                     const geohash = geohashForLocation([latitude, longitude]);
 
+                    const now = Date.now();
+                    const prev = lastGeoRef.current;
+                    const moved = prev ? haversineMeters(prev.lat, prev.lng, latitude, longitude) : Infinity;
+                    const elapsed = now - lastGeoWriteMsRef.current;
+
+                    const shouldWrite = elapsed >= GEO_WRITE_MIN_MS || moved >= GEO_MIN_MOVE_M;
+                    if (!shouldWrite) return;
+
+                    if (geoWriteInFlightRef.current) return;
+                    geoWriteInFlightRef.current = true;
+
                     await setDoc(
                         courierPublicRef,
                         { lat: latitude, lng: longitude, geohash, lastSeenAt: serverTimestamp(), updatedAt: serverTimestamp() },
                         { merge: true }
                     );
+
+                    lastGeoWriteMsRef.current = now;
+                    lastGeoRef.current = { lat: latitude, lng: longitude };
+                    geoWriteInFlightRef.current = false;
+
                 } catch (e: any) {
                     setErr(e?.message ?? "Failed to update location");
                 }
@@ -344,6 +381,11 @@ export default function CourierAppHome() {
     }
 
     async function logout() {
+        if (activeOrders.length > 0) {
+            setErr("You can't logout while you have active orders. Finish delivery or ask restaurant to remove you.");
+            return;
+        }
+
         try {
             if (isOnline) await setOnline(false);
         } catch {}
@@ -351,18 +393,13 @@ export default function CourierAppHome() {
         nav("/courier/login");
     }
 
+
     if (!user) return <div className="page"><div className="container container--mid">Not authorized</div></div>;
 
-    const hasActive = !!activeOrder;
-    const activeStatus: string | undefined = activeOrder?.status;
+    const activeCount = activeOrders.length;
+    const hasActive = activeCount > 0;
+    const reachedMaxActive = activeCount >= MAX_ACTIVE_ORDERS;
 
-    const canPickup = activeStatus === "taken";
-    const canDeliver = activeStatus === "picked_up";
-
-    const activeMapUrl =
-        activeOrder?.dropoffLat && activeOrder?.dropoffLng
-            ? `https://www.google.com/maps?q=${activeOrder.dropoffLat},${activeOrder.dropoffLng}`
-            : null;
 
     return (
         <div className="page">
@@ -387,13 +424,15 @@ export default function CourierAppHome() {
                                     Go online
                                 </button>
 
-                                <button className="btn" onClick={() => setOnline(false)} disabled={!isOnline}>
+                                <button className="btn" onClick={() => setOnline(false)} disabled={!isOnline || hasActive}>
                                     Go offline
                                 </button>
 
-                                <button className="btn btn--ghost" onClick={logout}>
+
+                                <button className="btn btn--ghost" onClick={logout} disabled={hasActive}>
                                     Logout
                                 </button>
+
                             </div>
                         </div>
 
@@ -408,111 +447,126 @@ export default function CourierAppHome() {
                 {/* Active order */}
                 <div style={{ height: 12 }} />
 
-                {activeOrder && (
-                    <div className="card">
-                        <div className="card__inner">
-                            <div className="row row--between row--wrap">
-                                <div className="row row--wrap">
-                                    <div style={{ fontWeight: 950, fontSize: 16 }}>
-                                        Active order <span className="mono">#{shortId(activeOrder.id)}</span>
-                                    </div>
-                                    <span className={`pill pill--${pillToneForOrderStatus(activeOrder.status)}`}>
-                    {labelForOrderStatus(activeOrder.status)}
-                  </span>
-                                </div>
+                {activeOrders.length > 0 && (
+                    <div className="stack">
+                        {activeOrders.slice(0, MAX_ACTIVE_ORDERS).map((ord: any) => {
+                            const st: string | undefined = ord?.status;
+                            const canPickup = st === "taken";
+                            const canDeliver = st === "picked_up";
 
-                                <div className="row row--wrap">
-                                    {/* step pills */}
-                                    <span className={`pill ${activeStatus === "taken" ? "pill--warning" : "pill--success"}`}>
-                    1 · TAKEN
-                  </span>
-                                    <span className={`pill ${activeStatus === "picked_up" ? "pill--info" : "pill--muted"}`}>
-                    2 · PICKED UP
-                  </span>
-                                    <span className="pill pill--muted">3 · DELIVERED</span>
-                                </div>
-                            </div>
+                            const mapUrl =
+                                ord?.dropoffLat && ord?.dropoffLng
+                                    ? `https://www.google.com/maps?q=${ord.dropoffLat},${ord.dropoffLng}`
+                                    : null;
 
-                            <div className="hr" />
+                            return (
+                                <div key={ord.id} className="card">
+                                    <div className="card__inner">
+                                        <div className="row row--between row--wrap">
+                                            <div className="row row--wrap">
+                                                <div style={{ fontWeight: 950, fontSize: 16 }}>
+                                                    Active order <span className="mono">#{shortId(ord.id)}</span>
+                                                </div>
+                                                <span className={`pill pill--${pillToneForOrderStatus(ord.status)}`}>
+                                    {labelForOrderStatus(ord.status)}
+                                </span>
+                                            </div>
 
-                            <div className="subcard">
-                                <div className="kv">
-                                    <div className="line">
-                                        <span>Customer</span>
-                                        <b>{activeOrder.customerName ?? "—"}</b>
-                                    </div>
+                                            <div className="row row--wrap">
+                                <span className={`pill ${st === "taken" ? "pill--warning" : "pill--success"}`}>
+                                    1 · TAKEN
+                                </span>
+                                                <span className={`pill ${st === "picked_up" ? "pill--info" : "pill--muted"}`}>
+                                    2 · PICKED UP
+                                </span>
+                                                <span className="pill pill--muted">3 · DELIVERED</span>
+                                            </div>
+                                        </div>
 
-                                    <div className="line">
-                                        <span>Phone</span>
-                                        <b>
-                                            {activeOrder.customerPhone ? (
-                                                <a href={`tel:${activeOrder.customerPhone}`} style={{ textDecoration: "none" }}>
-                                                    {activeOrder.customerPhone}
+                                        <div className="hr" />
+
+                                        <div className="subcard">
+                                            <div className="kv">
+                                                <div className="line">
+                                                    <span>Customer</span>
+                                                    <b>{ord.customerName ?? "—"}</b>
+                                                </div>
+
+                                                <div className="line">
+                                                    <span>Phone</span>
+                                                    <b>
+                                                        {ord.customerPhone ? (
+                                                            <a href={`tel:${ord.customerPhone}`} style={{ textDecoration: "none" }}>
+                                                                {ord.customerPhone}
+                                                            </a>
+                                                        ) : (
+                                                            "—"
+                                                        )}
+                                                    </b>
+                                                </div>
+
+                                                <div className="line" style={{ alignItems: "baseline" }}>
+                                                    <span>Address</span>
+                                                    <b style={{ textAlign: "right" }}>
+                                                        {ord.dropoffAddressText ?? ord.customerAddress ?? "—"}
+                                                    </b>
+                                                </div>
+
+                                                <div className="line">
+                                                    <span>Total</span>
+                                                    <b>{money(ord.orderTotal)}</b>
+                                                </div>
+
+                                                <div className="line">
+                                                    <span>Your fee</span>
+                                                    <b>{money(ord.deliveryFee)}</b>
+                                                </div>
+
+                                                <div className="line">
+                                                    <span>Pay</span>
+                                                    <b>{ord.paymentType ?? "—"}</b>
+                                                </div>
+                                            </div>
+                                        </div>
+
+                                        <div style={{ height: 12 }} />
+
+                                        <div className="row row--wrap row--mobile-stack">
+                                            <button
+                                                className="btn btn--primary"
+                                                onClick={() => markPickedUp(ord.id)}
+                                                disabled={!canPickup || busyOrderAction !== null}
+                                            >
+                                                {busyOrderAction === "pickup" ? "Saving…" : "Picked up"}
+                                            </button>
+
+                                            <button
+                                                className="btn btn--success"
+                                                onClick={() => markDelivered(ord.id)}
+                                                disabled={!canDeliver || busyOrderAction !== null}
+                                            >
+                                                {busyOrderAction === "deliver" ? "Saving…" : "Delivered"}
+                                            </button>
+
+                                            {mapUrl && (
+                                                <a className="btn btn--ghost" href={mapUrl} target="_blank" rel="noreferrer">
+                                                    Open map
                                                 </a>
-                                            ) : (
-                                                "—"
                                             )}
-                                        </b>
-                                    </div>
+                                        </div>
 
-                                    <div className="line" style={{ alignItems: "baseline" }}>
-                                        <span>Address</span>
-                                        <b style={{ textAlign: "right" }}>
-                                            {activeOrder.dropoffAddressText ?? activeOrder.customerAddress ?? "—"}
-                                        </b>
-                                    </div>
-
-                                    <div className="line">
-                                        <span>Total</span>
-                                        <b>{money(activeOrder.orderTotal)}</b>
-                                    </div>
-
-                                    <div className="line">
-                                        <span>Your fee</span>
-                                        <b>{money(activeOrder.deliveryFee)}</b>
-                                    </div>
-
-                                    <div className="line">
-                                        <span>Pay</span>
-                                        <b>{activeOrder.paymentType ?? "—"}</b>
+                                        {!canDeliver && (
+                                            <div className="muted" style={{ marginTop: 10, fontSize: 13 }}>
+                                                Tip: “Delivered” becomes available after “Picked up”.
+                                            </div>
+                                        )}
                                     </div>
                                 </div>
-                            </div>
-
-                            <div style={{ height: 12 }} />
-
-                            <div className="row row--wrap row--mobile-stack">
-                                <button
-                                    className="btn btn--primary"
-                                    onClick={() => markPickedUp(activeOrder.id)}
-                                    disabled={!canPickup || busyOrderAction !== null}
-                                >
-                                    {busyOrderAction === "pickup" ? "Saving…" : "Picked up"}
-                                </button>
-
-                                <button
-                                    className="btn btn--success"
-                                    onClick={() => markDelivered(activeOrder.id)}
-                                    disabled={!canDeliver || busyOrderAction !== null}
-                                >
-                                    {busyOrderAction === "deliver" ? "Saving…" : "Delivered"}
-                                </button>
-
-                                {activeMapUrl && (
-                                    <a className="btn btn--ghost" href={activeMapUrl} target="_blank" rel="noreferrer">
-                                        Open map
-                                    </a>
-                                )}
-                            </div>
-
-                            {!canDeliver && (
-                                <div className="muted" style={{ marginTop: 10, fontSize: 13 }}>
-                                    Tip: “Delivered” becomes available after “Picked up”.
-                                </div>
-                            )}
-                        </div>
+                            );
+                        })}
                     </div>
                 )}
+
 
                 {/* Offers */}
                 <div style={{ height: 12 }} />
@@ -525,11 +579,14 @@ export default function CourierAppHome() {
                                 <span className="pill pill--muted">{offers.length}</span>
                             </div>
 
-                            {hasActive && (
+                            <span className="pill pill--muted">Active {activeCount}/{MAX_ACTIVE_ORDERS}</span>
+
+                            {reachedMaxActive && (
                                 <span className="pill pill--warning">
-                  Finish active order to accept new ones
-                </span>
+        Max {MAX_ACTIVE_ORDERS} active orders reached
+    </span>
                             )}
+
                         </div>
 
                         <div className="hr" />
@@ -607,7 +664,8 @@ export default function CourierAppHome() {
                                             <button
                                                 className="btn btn--success"
                                                 onClick={() => acceptOffer(o)}
-                                                disabled={isBusy || hasActive}
+                                                disabled={isBusy || reachedMaxActive}
+
                                             >
                                                 {isBusy ? "Working…" : "Accept"}
                                             </button>
