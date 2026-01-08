@@ -5,6 +5,7 @@ import {
     doc,
     onSnapshot,
     query,
+    runTransaction,
     serverTimestamp,
     setDoc,
     updateDoc,
@@ -21,16 +22,24 @@ type Offer = {
     courierId: string;
     status: string;
 
+    // snapshot поля (чтобы курьер видел данные без чтения orders)
     customerName?: string;
     customerPhone?: string;
     customerAddress?: string;
+
+    dropoffLat?: number;
+    dropoffLng?: number;
+    dropoffGeohash?: string;
+    dropoffAddressText?: string;
 
     paymentType?: string;
     orderSubtotal?: number;
     deliveryFee?: number;
     orderTotal?: number;
 
-    dropoffAddressText?: string;
+    courierPaysAtPickup?: number;
+    courierCollectsFromCustomer?: number;
+    courierGetsFromRestaurantAtPickup?: number;
 };
 
 export default function CourierAppHome() {
@@ -53,8 +62,9 @@ export default function CourierAppHome() {
     const [err, setErr] = useState<string | null>(null);
 
     const [offers, setOffers] = useState<Offer[]>([]);
+    const [activeOrder, setActiveOrder] = useState<any | null>(null);
 
-    // гарантируем документы курьера
+    // --- ensure courier docs ---
     useEffect(() => {
         let cancelled = false;
 
@@ -62,7 +72,11 @@ export default function CourierAppHome() {
             if (!user || !courierPrivateRef || !courierPublicRef) return;
 
             try {
-                await setDoc(courierPrivateRef, { updatedAt: serverTimestamp() }, { merge: true });
+                await setDoc(
+                    courierPrivateRef,
+                    { updatedAt: serverTimestamp() },
+                    { merge: true }
+                );
 
                 await setDoc(
                     courierPublicRef,
@@ -80,7 +94,7 @@ export default function CourierAppHome() {
         };
     }, [user, courierPrivateRef, courierPublicRef]);
 
-    // подписка на offers (pending)
+    // --- subscribe to pending offers ---
     useEffect(() => {
         if (!user) return;
 
@@ -106,17 +120,51 @@ export default function CourierAppHome() {
                         customerPhone: data.customerPhone,
                         customerAddress: data.customerAddress,
 
+                        dropoffLat: data.dropoffLat,
+                        dropoffLng: data.dropoffLng,
+                        dropoffGeohash: data.dropoffGeohash,
+                        dropoffAddressText: data.dropoffAddressText,
+
                         paymentType: data.paymentType,
                         orderSubtotal: data.orderSubtotal,
                         deliveryFee: data.deliveryFee,
                         orderTotal: data.orderTotal,
 
-                        dropoffAddressText: data.dropoffAddressText,
+                        courierPaysAtPickup: data.courierPaysAtPickup,
+                        courierCollectsFromCustomer: data.courierCollectsFromCustomer,
+                        courierGetsFromRestaurantAtPickup: data.courierGetsFromRestaurantAtPickup,
                     };
                 });
+
                 setOffers(list);
             },
             (e: any) => setErr(e?.message ?? "Failed to load offers")
+        );
+
+        return () => unsub();
+    }, [user]);
+
+    // --- subscribe to active order (taken / picked_up) ---
+    useEffect(() => {
+        if (!user) return;
+
+        const q = query(
+            collection(db, "orders"),
+            where("assignedCourierId", "==", user.uid),
+            where("status", "in", ["taken", "picked_up"])
+        );
+
+        const unsub = onSnapshot(
+            q,
+            (snap) => {
+                if (snap.empty) {
+                    setActiveOrder(null);
+                    return;
+                }
+                const d = snap.docs[0];
+                setActiveOrder({ id: d.id, ...d.data() });
+            },
+            (e: any) => setErr(e?.message ?? "Failed to load active order")
         );
 
         return () => unsub();
@@ -126,6 +174,7 @@ export default function CourierAppHome() {
         if (!user || !courierPrivateRef || !courierPublicRef) return;
         setErr(null);
 
+        // stop tracking
         if (!next && watchId.current !== null) {
             navigator.geolocation.clearWatch(watchId.current);
             watchId.current = null;
@@ -194,11 +243,45 @@ export default function CourierAppHome() {
         );
     }
 
-    async function acceptOffer(offerId: string) {
-        await updateDoc(doc(db, "offers", offerId), {
-            status: "accepted",
-            updatedAt: serverTimestamp(),
-        });
+    // ✅ Вариант A: первый, кто нажал Accept — забирает заказ
+    async function acceptOffer(offer: Offer) {
+        if (!auth.currentUser) return;
+
+        const uid = auth.currentUser.uid;
+        const offerRef = doc(db, "offers", offer.id);
+        const orderRef = doc(db, "orders", offer.orderId);
+
+        setErr(null);
+
+        try {
+            await runTransaction(db, async (tx) => {
+                const orderSnap = await tx.get(orderRef);
+                if (!orderSnap.exists()) throw new Error("Order not found");
+
+                const orderData: any = orderSnap.data();
+
+                // уже взял другой курьер
+                if (orderData.assignedCourierId && orderData.assignedCourierId !== uid) {
+                    tx.update(offerRef, { status: "declined", updatedAt: serverTimestamp() });
+                    throw new Error("Order already taken by another courier");
+                }
+
+                // если свободен — назначаем себя
+                if (!orderData.assignedCourierId) {
+                    tx.update(orderRef, {
+                        assignedCourierId: uid,
+                        status: "taken",
+                        acceptedAt: serverTimestamp(),
+                        updatedAt: serverTimestamp(),
+                    });
+                }
+
+                // помечаем offer accepted
+                tx.update(offerRef, { status: "accepted", updatedAt: serverTimestamp() });
+            });
+        } catch (e: any) {
+            setErr(e?.message ?? "Failed to accept offer");
+        }
     }
 
     async function declineOffer(offerId: string) {
@@ -207,7 +290,21 @@ export default function CourierAppHome() {
             updatedAt: serverTimestamp(),
         });
     }
+    async function markPickedUp(orderId: string) {
+        await updateDoc(doc(db, "orders", orderId), {
+            status: "picked_up",
+            pickedUpAt: serverTimestamp(),
+            updatedAt: serverTimestamp(),
+        });
+    }
 
+    async function markDelivered(orderId: string) {
+        await updateDoc(doc(db, "orders", orderId), {
+            status: "delivered",
+            deliveredAt: serverTimestamp(),
+            updatedAt: serverTimestamp(),
+        });
+    }
     async function logout() {
         try {
             if (isOnline) await setOnline(false);
@@ -244,6 +341,52 @@ export default function CourierAppHome() {
 
             {err && <p style={{ color: "crimson" }}>{err}</p>}
 
+            {activeOrder && (
+                <div
+                    style={{
+                        border: "1px solid #333",
+                        borderRadius: 10,
+                        padding: 12,
+                        marginBottom: 12,
+                    }}
+                >
+                    <h3 style={{ marginTop: 0 }}>Active order</h3>
+                    <div>
+                        Order: <b>{activeOrder.id}</b>
+                    </div>
+                    <div>
+                        Customer: <b>{activeOrder.customerName ?? "—"}</b>
+                    </div>
+                    <div>
+                        Phone: <b>{activeOrder.customerPhone ?? "—"}</b>
+                    </div>
+                    <div>
+                        Address:{" "}
+                        <b>
+                            {activeOrder.dropoffAddressText ??
+                                activeOrder.customerAddress ??
+                                "—"}
+                        </b>
+                    </div>
+                    <div style={{ marginTop: 6, color: "#666" }}>
+                        Total: <b>{activeOrder.orderTotal ?? "—"}</b> | Fee:{" "}
+                        <b>{activeOrder.deliveryFee ?? "—"}</b> | Pay:{" "}
+                        <b>{activeOrder.paymentType ?? "—"}</b>
+                    </div>
+                    <div style={{ display: "flex", gap: 8, marginTop: 10 }}>
+                        <button onClick={() => markPickedUp(activeOrder.id)}>
+                            Picked up
+                        </button>
+
+                        <button onClick={() => markDelivered(activeOrder.id)}>
+                            Delivered
+                        </button>
+                    </div>
+
+                </div>
+
+            )}
+
             <hr />
 
             <h3>New offers</h3>
@@ -272,16 +415,18 @@ export default function CourierAppHome() {
                             Phone: <b>{o.customerPhone ?? "—"}</b>
                         </div>
                         <div>
-                            Address: <b>{o.dropoffAddressText ?? o.customerAddress ?? "—"}</b>
+                            Address:{" "}
+                            <b>{o.dropoffAddressText ?? o.customerAddress ?? "—"}</b>
                         </div>
+
                         <div style={{ marginTop: 6, color: "#666" }}>
-                            Total: <b>{o.orderTotal ?? "—"}</b> | Fee: <b>{o.deliveryFee ?? "—"}</b> | Pay:{" "}
-                            <b>{o.paymentType ?? "—"}</b>
+                            Total: <b>{o.orderTotal ?? "—"}</b> | Fee:{" "}
+                            <b>{o.deliveryFee ?? "—"}</b> | Pay: <b>{o.paymentType ?? "—"}</b>
                         </div>
                     </div>
 
                     <div style={{ display: "flex", gap: 8, marginTop: 10 }}>
-                        <button onClick={() => acceptOffer(o.id)}>Accept</button>
+                        <button onClick={() => acceptOffer(o)}>Accept</button>
                         <button onClick={() => declineOffer(o.id)}>Decline</button>
                     </div>
                 </div>
