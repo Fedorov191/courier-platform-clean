@@ -31,6 +31,12 @@ type Offer = {
     dropoffGeohash?: string;
     dropoffAddressText?: string;
 
+    pickupLat?: number;
+    pickupLng?: number;
+    pickupGeohash?: string;
+    pickupAddressText?: string;
+
+
     paymentType?: string;
     orderSubtotal?: number;
     deliveryFee?: number;
@@ -49,6 +55,22 @@ function money(n?: number) {
     const x = typeof n === "number" && Number.isFinite(n) ? n : 0;
     return `₪${x.toFixed(2)}`;
 }
+function wazeUrl(lat?: number, lng?: number) {
+    if (typeof lat !== "number" || typeof lng !== "number") return null;
+    return `https://waze.com/ul?ll=${lat},${lng}&navigate=yes`;
+}
+
+function yandexMapsUrl(lat?: number, lng?: number) {
+    if (typeof lat !== "number" || typeof lng !== "number") return null;
+    // yandex maps использует pt=lng,lat
+    return `https://yandex.com/maps/?pt=${lng},${lat}&z=17&l=map`;
+}
+
+function googleMapsUrl(lat?: number, lng?: number) {
+    if (typeof lat !== "number" || typeof lng !== "number") return null;
+    return `https://www.google.com/maps?q=${lat},${lng}`;
+}
+
 const MAX_ACTIVE_ORDERS = 3;
 const MAX_PENDING_OFFERS = 3;
 
@@ -184,6 +206,12 @@ export default function CourierAppHome() {
                         dropoffLng: data.dropoffLng,
                         dropoffGeohash: data.dropoffGeohash,
                         dropoffAddressText: data.dropoffAddressText,
+
+                        pickupLat: data.pickupLat,
+                        pickupLng: data.pickupLng,
+                        pickupGeohash: data.pickupGeohash,
+                        pickupAddressText: data.pickupAddressText,
+
 
                         paymentType: data.paymentType,
                         orderSubtotal: data.orderSubtotal,
@@ -495,10 +523,18 @@ export default function CourierAppHome() {
                             const canPickup = st === "taken";
                             const canDeliver = st === "picked_up";
 
-                            const mapUrl =
-                                ord?.dropoffLat && ord?.dropoffLng
-                                    ? `https://www.google.com/maps?q=${ord.dropoffLat},${ord.dropoffLng}`
-                                    : null;
+                            const pickupMain =
+                                wazeUrl(ord?.pickupLat, ord?.pickupLng) ??
+                                googleMapsUrl(ord?.pickupLat, ord?.pickupLng);
+
+                            const pickupYandex = yandexMapsUrl(ord?.pickupLat, ord?.pickupLng);
+
+                            const dropoffMain =
+                                wazeUrl(ord?.dropoffLat, ord?.dropoffLng) ??
+                                googleMapsUrl(ord?.dropoffLat, ord?.dropoffLng);
+
+                            const dropoffYandex = yandexMapsUrl(ord?.dropoffLat, ord?.dropoffLng);
+
 
                             return (
                                 <div key={ord.id} className="card">
@@ -589,11 +625,30 @@ export default function CourierAppHome() {
                                                 {busyOrderAction === "deliver" ? "Saving…" : "Delivered"}
                                             </button>
 
-                                            {mapUrl && (
-                                                <a className="btn btn--ghost" href={mapUrl} target="_blank" rel="noreferrer">
-                                                    Open map
+                                            {/* До pickup (taken) показываем маршрут в ресторан */}
+                                            {canPickup && pickupMain && (
+                                                <a className="btn btn--ghost" href={pickupMain} target="_blank" rel="noreferrer">
+                                                    Маршрут в ресторан
                                                 </a>
                                             )}
+                                            {canPickup && pickupYandex && (
+                                                <a className="btn btn--ghost" href={pickupYandex} target="_blank" rel="noreferrer">
+                                                    Яндекс
+                                                </a>
+                                            )}
+
+                                            {/* После pickup (picked_up) показываем маршрут к клиенту */}
+                                            {canDeliver && dropoffMain && (
+                                                <a className="btn btn--ghost" href={dropoffMain} target="_blank" rel="noreferrer">
+                                                    Маршрут к клиенту
+                                                </a>
+                                            )}
+                                            {canDeliver && dropoffYandex && (
+                                                <a className="btn btn--ghost" href={dropoffYandex} target="_blank" rel="noreferrer">
+                                                    Яндекс
+                                                </a>
+                                            )}
+
                                         </div>
 
                                         {!canDeliver && (
@@ -636,10 +691,11 @@ export default function CourierAppHome() {
 
                         <div className="stack">
                             {offers.map((o) => {
-                                const offerMapUrl =
-                                    o.dropoffLat && o.dropoffLng
-                                        ? `https://www.google.com/maps?q=${o.dropoffLat},${o.dropoffLng}`
-                                        : null;
+                                const pickupMain =
+                                    wazeUrl(o.pickupLat, o.pickupLng) ??
+                                    googleMapsUrl(o.pickupLat, o.pickupLng);
+
+                                const pickupYandex = yandexMapsUrl(o.pickupLat, o.pickupLng);
 
                                 const isBusy = busyOfferId === o.id;
 
@@ -658,11 +714,17 @@ export default function CourierAppHome() {
                                                 <span className="pill pill--success">Fee {money(o.deliveryFee)}</span>
                                             </div>
 
-                                            {offerMapUrl && (
-                                                <a className="btn btn--ghost" href={offerMapUrl} target="_blank" rel="noreferrer">
-                                                    Map
+                                            {pickupMain && (
+                                                <a className="btn btn--ghost" href={pickupMain} target="_blank" rel="noreferrer">
+                                                    Маршрут в ресторан
                                                 </a>
                                             )}
+                                            {pickupYandex && (
+                                                <a className="btn btn--ghost" href={pickupYandex} target="_blank" rel="noreferrer">
+                                                    Яндекс
+                                                </a>
+                                            )}
+
                                         </div>
 
                                         <div style={{ height: 10 }} />
