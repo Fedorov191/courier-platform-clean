@@ -104,6 +104,8 @@ export function RestaurantDispatcher() {
 
     const inFlightOrderIds = useRef<Set<string>>(new Set());
     const inFlightOfferIds = useRef<Set<string>>(new Set());
+    const dispatchTickInFlightRef = useRef(false);
+
 
     useEffect(() => {
         const unsub = onAuthStateChanged(auth, (u) => setUid(u?.uid ?? null));
@@ -364,71 +366,63 @@ export function RestaurantDispatcher() {
     useEffect(() => {
         if (!uid) return;
 
-        async function dispatch() {
-            const openOrders = orders.filter((o) => {
-                const isOpen = o.status === "new" || o.status === "offered";
-                const unassigned = !o.assignedCourierId;
-                const notCancelled = o.status !== "cancelled";
-                return isOpen && unassigned && notCancelled;
-            });
+        let cancelled = false;
 
-            for (const ord of openOrders) {
-                if (pendingOfferByOrderId.has(ord.id)) continue;
+        async function dispatchOnce() {
+            if (cancelled) return;
+            if (dispatchTickInFlightRef.current) return;
 
-                const courierId = pickCourierId(ord, usableCouriers);
+            dispatchTickInFlightRef.current = true;
+            try {
+                const openOrders = orders.filter((o) => {
+                    const isOpen = o.status === "new" || o.status === "offered";
+                    const unassigned = !o.assignedCourierId;
+                    const notCancelled = o.status !== "cancelled";
+                    return isOpen && unassigned && notCancelled;
+                });
 
-                // нет курьеров онлайн — просто ждём
-                if (!courierId) {
-                    // можно привести offered→new, чтобы UI был красивее
-                    if (ord.status === "offered") {
-                        try {
-                            await updateDoc(doc(db, "orders", ord.id), {
-                                status: "new",
-                                updatedAt: serverTimestamp(),
-                            });
-                        } catch {}
-                    }
-                    continue;
-                }
-                const nowMs = Date.now();
+                for (const ord of openOrders) {
+                    if (pendingOfferByOrderId.has(ord.id)) continue;
 
-// ✅ если пытаемся снова предложить тому же курьеру, и других кандидатов нет — НЕ спамим мгновенно
-                if (courierId === (ord.lastOfferedCourierId ?? null) && usableCouriers.length <= 1) {
-                    const until = (ord as any).reofferAfterMs;
+                    const courierId = pickCourierId(ord, usableCouriers);
 
-                    // если cooldown ещё идёт — просто ждём
-                    if (typeof until === "number" && nowMs < until) {
+                    // нет курьеров онлайн — просто ждём
+                    if (!courierId) {
+                        if (ord.status === "offered") {
+                            try {
+                                await updateDoc(doc(db, "orders", ord.id), {
+                                    status: "new",
+                                    updatedAt: serverTimestamp(),
+                                });
+                            } catch {}
+                        }
                         continue;
                     }
 
-                    // если cooldown не был выставлен — выставляем и ждём
-                    if (typeof until !== "number") {
-                        try {
-                            await updateDoc(doc(db, "orders", ord.id), {
-                                reofferAfterMs: nowMs + REOFFER_SAME_COURIER_COOLDOWN_MS,
-                                updatedAt: serverTimestamp(),
-                            });
-                        } catch {}
-                        continue;
+                    if (inFlightOrderIds.current.has(ord.id)) continue;
+                    inFlightOrderIds.current.add(ord.id);
+
+                    try {
+                        await createOfferTx(uid, ord.id, courierId);
+                    } catch {}
+                    finally {
+                        inFlightOrderIds.current.delete(ord.id);
                     }
-
-                    // если until был и уже прошёл — разрешаем создать новый оффер (пойдём дальше по коду)
                 }
-
-                if (inFlightOrderIds.current.has(ord.id)) continue;
-                inFlightOrderIds.current.add(ord.id);
-
-                try {
-                    await createOfferTx(uid, ord.id, courierId);
-                } catch {}
-                finally {
-                    inFlightOrderIds.current.delete(ord.id);
-                }
+            } finally {
+                dispatchTickInFlightRef.current = false;
             }
         }
 
-        dispatch();
+        dispatchOnce(); // сразу
+        const id = window.setInterval(dispatchOnce, 2000);
+
+        return () => {
+            cancelled = true;
+            window.clearInterval(id);
+        };
     }, [uid, orders, pendingOfferByOrderId, usableCouriers]);
+
 
     return null;
 }
