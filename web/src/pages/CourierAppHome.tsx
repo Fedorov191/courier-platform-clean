@@ -416,6 +416,10 @@ export default function CourierAppHome() {
                 if (!orderSnap.exists()) throw new Error("Order not found");
 
                 const orderData: any = orderSnap.data();
+                if (orderData.status === "cancelled" || orderData.status === "delivered") {
+                    tx.update(offerRef, { status: "declined", updatedAt: serverTimestamp() });
+                    throw new Error("Order is no longer available");
+                }
 
                 if (orderData.assignedCourierId && orderData.assignedCourierId !== uid) {
                     tx.update(offerRef, { status: "declined", updatedAt: serverTimestamp() });

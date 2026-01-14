@@ -1,4 +1,5 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState, useRef } from "react";
+
 import { onAuthStateChanged } from "firebase/auth";
 import {
     collection,
@@ -10,7 +11,9 @@ import {
     doc,
     updateDoc,
     serverTimestamp,
+    addDoc,
 } from "firebase/firestore";
+
 
 import { auth, db } from "../lib/firebase";
 import { useNavigate } from "react-router-dom";
@@ -22,6 +25,18 @@ type PaymentMethod = "cash" | "card";
 type OrderDoc = {
     id: string;
     restaurantId: string;
+
+    pickupLat?: number;
+    pickupLng?: number;
+    pickupGeohash?: string;
+    pickupAddressText?: string;
+
+    dropoffLat?: number;
+    dropoffLng?: number;
+    dropoffGeohash?: string;
+    dropoffAddressText?: string;
+
+    triedCourierIds?: string[];
 
     customerName: string;
     customerAddress: string;
@@ -84,12 +99,60 @@ function money(n: number) {
     const x = Number.isFinite(n) ? n : 0;
     return `₪${x.toFixed(2)}`;
 }
+type CourierPublicDoc = {
+    id: string; // docId = courierId
+    isOnline?: boolean;
+    lat?: number;
+    lng?: number;
+    lastSeenAt?: Timestamp;
+};
+
+type PendingOfferDoc = {
+    id: string;
+    orderId: string;
+    courierId: string;
+    createdAt?: Timestamp;
+    expiresAt?: Timestamp;
+};
+
+const OFFER_TTL_MS = 25_000;         // оффер живёт 25 секунд
+const COURIER_STALE_MS = 2 * 60_000; // если lastSeenAt старше 2 минут — считаем курьера “пропавшим”
+
+function tsToMs(ts?: Timestamp) {
+    if (!ts) return null;
+    return ts.toDate().getTime();
+}
+
+function isOfferExpired(o: PendingOfferDoc, nowMs: number) {
+    const exp = tsToMs(o.expiresAt);
+    if (exp !== null) return nowMs >= exp;
+
+    const created = tsToMs(o.createdAt);
+    if (created === null) return false; // нет тайминга — не трогаем
+    return nowMs - created >= OFFER_TTL_MS;
+}
+
+function haversineMeters(lat1: number, lon1: number, lat2: number, lon2: number) {
+    const R = 6371000;
+    const toRad = (d: number) => (d * Math.PI) / 180;
+    const dLat = toRad(lat2 - lat1);
+    const dLon = toRad(lon2 - lon1);
+    const a =
+        Math.sin(dLat / 2) ** 2 +
+        Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon / 2) ** 2;
+    const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+    return R * c;
+}
 
 export function OrdersPage() {
     const navigate = useNavigate();
 
     const [uid, setUid] = useState<string | null>(auth.currentUser?.uid ?? null);
     const [loading, setLoading] = useState(true);
+    const [onlineCouriers, setOnlineCouriers] = useState<CourierPublicDoc[]>([]);
+    const [pendingOffersByOrderId, setPendingOffersByOrderId] = useState<Record<string, PendingOfferDoc>>({});
+    const dispatchInFlightRef = useRef(false);
+
     const [orders, setOrders] = useState<OrderDoc[]>([]);
     const [error, setError] = useState<string>("");
     const [tab, setTab] = useState<"active" | "completed" | "cancelled">("active");
@@ -100,6 +163,194 @@ export function OrdersPage() {
         const unsub = onAuthStateChanged(auth, (u) => setUid(u?.uid ?? null));
         return () => unsub();
     }, []);
+    useEffect(() => {
+        if (!uid) return;
+
+        const q = query(collection(db, "courierPublic"), where("isOnline", "==", true));
+        const unsub = onSnapshot(
+            q,
+            (snap) => {
+                const list: CourierPublicDoc[] = snap.docs.map((d) => {
+                    const data: any = d.data();
+                    return {
+                        id: d.id,
+                        isOnline: data.isOnline,
+                        lat: data.lat,
+                        lng: data.lng,
+                        lastSeenAt: data.lastSeenAt,
+                    };
+                });
+                setOnlineCouriers(list);
+            },
+            (e) => setError(e?.message ?? "Failed to load couriers")
+        );
+
+        return () => unsub();
+    }, [uid]);
+    useEffect(() => {
+        if (!uid) return;
+
+        const q = query(
+            collection(db, "offers"),
+            where("restaurantId", "==", uid),
+            where("status", "==", "pending")
+        );
+
+        const unsub = onSnapshot(
+            q,
+            (snap) => {
+                const map: Record<string, PendingOfferDoc> = {};
+                snap.docs.forEach((d) => {
+                    const data: any = d.data();
+                    const orderId = String(data.orderId ?? "");
+                    if (!orderId) return;
+
+                    map[orderId] = {
+                        id: d.id,
+                        orderId,
+                        courierId: String(data.courierId ?? ""),
+                        createdAt: data.createdAt,
+                        expiresAt: data.expiresAt,
+                    };
+                });
+                setPendingOffersByOrderId(map);
+            },
+            (e) => setError(e?.message ?? "Failed to load offers")
+        );
+
+        return () => unsub();
+    }, [uid]);
+    useEffect(() => {
+        if (!uid) return;
+
+        async function expireOffer(offerId: string) {
+            await updateDoc(doc(db, "offers", offerId), {
+                status: "expired",
+                updatedAt: serverTimestamp(),
+            });
+        }
+
+        async function tick() {
+            if (dispatchInFlightRef.current) return;
+            dispatchInFlightRef.current = true;
+
+            try {
+                const now = Date.now();
+
+                // 1) фильтруем “живых” online курьеров
+                const available = onlineCouriers.filter((c) => {
+                    if (!c.isOnline) return false;
+                    if (typeof c.lat !== "number" || typeof c.lng !== "number") return false;
+
+                    const lastSeenMs = tsToMs(c.lastSeenAt);
+                    if (lastSeenMs === null) return false;
+                    if (now - lastSeenMs > COURIER_STALE_MS) return false;
+
+                    return true;
+                });
+
+                if (available.length === 0) return;
+
+                // 2) Идём по заказам: один тик = максимум 1 новый оффер (чтобы не спамить)
+                for (const o of orders) {
+                    // если заказ уже не нуждается в офферах — чистим pending (если вдруг остался)
+                    const pending = pendingOffersByOrderId[o.id];
+
+                    if (o.assignedCourierId || o.status === "cancelled" || o.status === "delivered") {
+                        if (pending) await expireOffer(pending.id);
+                        continue;
+                    }
+
+                    // если есть pending и он ещё жив — ничего не делаем
+                    if (pending && !isOfferExpired(pending, now)) continue;
+
+                    // если pending протух — закрываем его
+                    if (pending && isOfferExpired(pending, now)) {
+                        await expireOffer(pending.id);
+                        await updateDoc(doc(db, "orders", o.id), { status: "new", updatedAt: serverTimestamp() });
+                    }
+
+                    // нужен новый оффер: проверяем что есть pickup координаты
+                    if (typeof o.pickupLat !== "number" || typeof o.pickupLng !== "number") continue;
+
+                    const tried = Array.isArray(o.triedCourierIds) ? o.triedCourierIds : [];
+
+                    // сортируем курьеров по расстоянию до ресторана (pickup)
+                    const ranked = available
+                        .map((c) => ({
+                            id: c.id,
+                            dist: haversineMeters(o.pickupLat!, o.pickupLng!, c.lat!, c.lng!),
+                        }))
+                        .sort((a, b) => a.dist - b.dist);
+
+                    const availableIds = ranked.map((x) => x.id);
+                    const allTried = availableIds.length > 0 && availableIds.every((id) => tried.includes(id));
+
+                    const effectiveTried = allTried ? [] : tried;
+                    const candidate = ranked.find((x) => !effectiveTried.includes(x.id));
+                    if (!candidate) continue;
+
+                    const courierId = candidate.id;
+                    const nextTried = allTried ? [courierId] : Array.from(new Set([...tried, courierId]));
+
+                    const expiresAt = Timestamp.fromDate(new Date(Date.now() + OFFER_TTL_MS));
+
+                    // создаём offer (с полным snapshot для курьера)
+                    await addDoc(collection(db, "offers"), {
+                        restaurantId: uid,
+                        courierId,
+                        orderId: o.id,
+
+                        pickupLat: o.pickupLat,
+                        pickupLng: o.pickupLng,
+                        pickupGeohash: o.pickupGeohash,
+                        pickupAddressText: o.pickupAddressText,
+
+                        customerName: o.customerName,
+                        customerPhone: o.customerPhone,
+                        customerAddress: o.customerAddress,
+
+                        dropoffLat: o.dropoffLat,
+                        dropoffLng: o.dropoffLng,
+                        dropoffGeohash: o.dropoffGeohash,
+                        dropoffAddressText: o.dropoffAddressText,
+
+                        paymentType: o.paymentType,
+                        orderSubtotal: o.orderSubtotal,
+                        deliveryFee: o.deliveryFee,
+                        orderTotal: o.orderTotal,
+
+                        courierPaysAtPickup: o.courierPaysAtPickup,
+                        courierCollectsFromCustomer: o.courierCollectsFromCustomer,
+                        courierGetsFromRestaurantAtPickup: o.courierGetsFromRestaurantAtPickup,
+
+                        status: "pending",
+                        expiresAt,
+                        createdAt: serverTimestamp(),
+                        updatedAt: serverTimestamp(),
+                    });
+
+                    // обновляем заказ
+                    await updateDoc(doc(db, "orders", o.id), {
+                        status: "offered",
+                        triedCourierIds: nextTried,
+                        updatedAt: serverTimestamp(),
+                    });
+
+                    break; // максимум 1 оффер за тик
+                }
+            } catch (e: any) {
+                // можно логировать, но не спамить UI каждую секунду
+                // setError(e?.message ?? "Dispatcher error");
+            } finally {
+                dispatchInFlightRef.current = false;
+            }
+        }
+
+        tick();
+        const id = window.setInterval(tick, 2000);
+        return () => window.clearInterval(id);
+    }, [uid, orders, onlineCouriers, pendingOffersByOrderId]);
 
     useEffect(() => {
         setError("");
@@ -126,6 +377,18 @@ export function OrdersPage() {
                     return {
                         id: d.id,
                         restaurantId: data.restaurantId,
+
+                        pickupLat: data.pickupLat,
+                        pickupLng: data.pickupLng,
+                        pickupGeohash: data.pickupGeohash,
+                        pickupAddressText: data.pickupAddressText,
+
+                        dropoffLat: data.dropoffLat,
+                        dropoffLng: data.dropoffLng,
+                        dropoffGeohash: data.dropoffGeohash,
+                        dropoffAddressText: data.dropoffAddressText,
+
+                        triedCourierIds: Array.isArray(data.triedCourierIds) ? data.triedCourierIds : [],
 
                         customerName: data.customerName ?? "",
                         customerAddress: data.customerAddress ?? "",

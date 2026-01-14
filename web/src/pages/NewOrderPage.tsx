@@ -182,20 +182,7 @@ export function NewOrderPage() {
         };
     }, [form.paymentType, subtotal, fee]);
 
-    async function pickAnyOnlineCourierId(): Promise<string | null> {
-        // MVP: берём любого online курьера (без сортировки по расстоянию)
-        const q = query(
-            collection(db, "courierPublic"),
-            where("isOnline", "==", true),
-            limit(1)
-        );
 
-        const snap = await getDocs(q);
-        if (snap.empty) return null;
-
-        // id документа = courierId (мы так пишем в courierPublic/{uid})
-        return snap.docs[0].id;
-    }
 
     const onSubmit = async (e: React.FormEvent) => {
         e.preventDefault();
@@ -244,6 +231,7 @@ export function NewOrderPage() {
 
                 status: "new",
                 assignedCourierId: null,
+                triedCourierIds: [],
 
                 acceptedAt: null,
                 pickedUpAt: null,
@@ -255,50 +243,11 @@ export function NewOrderPage() {
             };
 
             // 1) Создаём заказ
-            const orderRef = await addDoc(collection(db, "orders"), orderDoc);
+            await addDoc(collection(db, "orders"), orderDoc);
 
-            // 2) Ищем любого online курьера
-            const courierId = await pickAnyOnlineCourierId();
 
-            // 3) Если нашли — создаём offer
-            if (courierId) {
-                await addDoc(collection(db, "offers"), {
-                    pickupLat: orderDoc.pickupLat,
-                    pickupLng: orderDoc.pickupLng,
-                    pickupGeohash: orderDoc.pickupGeohash,
-                    pickupAddressText: orderDoc.pickupAddressText,
 
-                    restaurantId: uid,
-                    courierId,
-                    orderId: orderRef.id,
-
-                    // ✅ snapshot for courier UI (so courier doesn't need to read orders)
-                    customerName: orderDoc.customerName,
-                    customerPhone: orderDoc.customerPhone,
-                    customerAddress: orderDoc.customerAddress,
-
-                    dropoffLat: orderDoc.dropoffLat,
-                    dropoffLng: orderDoc.dropoffLng,
-                    dropoffGeohash: orderDoc.dropoffGeohash,
-                    dropoffAddressText: orderDoc.dropoffAddressText,
-
-                    paymentType: orderDoc.paymentType,
-                    orderSubtotal: orderDoc.orderSubtotal,
-                    deliveryFee: orderDoc.deliveryFee,
-                    orderTotal: orderDoc.orderTotal,
-
-                    courierPaysAtPickup: orderDoc.courierPaysAtPickup,
-                    courierCollectsFromCustomer: orderDoc.courierCollectsFromCustomer,
-                    courierGetsFromRestaurantAtPickup: orderDoc.courierGetsFromRestaurantAtPickup,
-
-                    status: "pending",
-                    createdAt: serverTimestamp(),
-                    updatedAt: serverTimestamp(),
-                });
-
-            }
-
-            // 4) Возвращаемся к списку
+            // 2) Возвращаемся к списку
             navigate("/restaurant/app/orders");
         } catch (err: any) {
             setSubmitError(err?.message ?? "Failed to create order");

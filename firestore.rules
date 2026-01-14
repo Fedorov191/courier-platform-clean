@@ -78,7 +78,10 @@ match /orders/{orderId} {
         ||
         (isRestaurant() && resource.data.restaurantId == request.auth.uid)
       );
-
+allow update: if signedIn() && (
+  (isCourier() && resource.data.courierId == request.auth.uid) ||
+  (isRestaurant() && resource.data.restaurantId == request.auth.uid)
+);
       // ✅ курьер может менять статус только своего offer (accept/decline)
       allow update: if signedIn() && isCourier() && resource.data.courierId == request.auth.uid;
 
