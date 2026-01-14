@@ -1,6 +1,7 @@
 import { NavLink, Outlet, useNavigate } from "react-router-dom";
 import { signOut } from "firebase/auth";
 import { auth } from "../lib/firebase";
+import { RestaurantDispatcher } from "../pages/RestaurantDispatcher";
 
 export function AppLayout() {
     const nav = useNavigate();
@@ -37,6 +38,9 @@ export function AppLayout() {
                         </div>
                     </div>
                 </header>
+
+                {/* ✅ Диспетчер офферов: работает пока открыт кабинет ресторана */}
+                <RestaurantDispatcher />
 
                 <div style={{ height: 12 }} />
                 <Outlet />

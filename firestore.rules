@@ -28,62 +28,91 @@ service cloud.firestore {
       allow write: if signedIn() && isCourier() && request.auth.uid == courierId;
     }
 
-   // --- Orders ---
-match /orders/{orderId} {
+    // --- Orders ---
+    match /orders/{orderId} {
 
-  // CREATE: только ресторан создаёт заказ для себя
-  allow create: if signedIn()
-    && isRestaurant()
-    && request.resource.data.restaurantId == request.auth.uid
-    // (опционально) при создании заказ не должен быть "назначен" на курьера
-    && (
-      !("assignedCourierId" in request.resource.data)
-      || request.resource.data.assignedCourierId == null
-    );
+      // CREATE: только ресторан создаёт заказ для себя
+      allow create: if signedIn()
+        && isRestaurant()
+        && request.resource.data.restaurantId == request.auth.uid
+        && (
+          !("assignedCourierId" in request.resource.data)
+          || request.resource.data.assignedCourierId == null
+        );
 
-  // READ (как было)
-  allow read: if signedIn() && (
-    (isRestaurant() && resource.data.restaurantId == request.auth.uid)
-    ||
-    (isCourier() && (
-      resource.data.assignedCourierId == request.auth.uid
-      || resource.data.assignedCourierId == null
-    ))
-  );
+      allow read: if signedIn() && (
+        (isRestaurant() && resource.data.restaurantId == request.auth.uid)
+        ||
+        (isCourier() && (
+          resource.data.assignedCourierId == request.auth.uid
+          || resource.data.assignedCourierId == null
+        ))
+      );
 
-  // UPDATE (как было)
-  allow update: if signedIn() && (
-    (isRestaurant() && resource.data.restaurantId == request.auth.uid)
-    ||
-    (isCourier() && (
-      (
-        resource.data.assignedCourierId == null &&
-        request.resource.data.assignedCourierId == request.auth.uid
-      )
-      ||
-      (resource.data.assignedCourierId == request.auth.uid)
-    ))
-  );
+      // UPDATE:
+      // - ресторан может обновлять свой заказ
+      // - курьер может "взять" заказ только если статус new/offered (НЕ cancelled)
+      // - и дальше вести заказ только если он назначен ему
+      allow update: if signedIn() && (
+        (isRestaurant() && resource.data.restaurantId == request.auth.uid)
+        ||
+        (isCourier() && (
+          (
+            resource.data.assignedCourierId == null
+            && (resource.data.status == "new" || resource.data.status == "offered")
+            && request.resource.data.assignedCourierId == request.auth.uid
+            && request.resource.data.status == "taken"
+          )
+          ||
+          (
+            resource.data.assignedCourierId == request.auth.uid
+            && (resource.data.status == "taken" || resource.data.status == "picked_up")
+          )
+        ))
+      );
 
-  allow delete: if false;
-}
-
+      allow delete: if false;
+    }
 
     // --- Offers ---
     match /offers/{offerId} {
-      allow create: if signedIn() && isRestaurant() && request.resource.data.restaurantId == request.auth.uid;
+      allow create: if signedIn()
+        && isRestaurant()
+        && request.resource.data.restaurantId == request.auth.uid;
 
       allow read: if signedIn() && (
         (isCourier() && resource.data.courierId == request.auth.uid)
         ||
         (isRestaurant() && resource.data.restaurantId == request.auth.uid)
       );
-allow update: if signedIn() && (
-  (isCourier() && resource.data.courierId == request.auth.uid) ||
-  (isRestaurant() && resource.data.restaurantId == request.auth.uid)
-);
-      // ✅ курьер может менять статус только своего offer (accept/decline)
-      allow update: if signedIn() && isCourier() && resource.data.courierId == request.auth.uid;
+
+      // Ресторан имеет право:
+      // - отметить pending offer как expired через 25 секунд
+      // - отменить pending offer (например если заказ отменён)
+      function restaurantCanExpireOffer() {
+        return isRestaurant()
+          && resource.data.restaurantId == request.auth.uid
+          && resource.data.status == "pending"
+          && request.resource.data.status == "expired"
+          && resource.data.createdAt != null
+          && request.time > resource.data.createdAt + duration.value(25, "s")
+          && request.resource.data.diff(resource.data).changedKeys().hasOnly(["status", "updatedAt"]);
+      }
+
+      function restaurantCanCancelOffer() {
+        return isRestaurant()
+          && resource.data.restaurantId == request.auth.uid
+          && resource.data.status == "pending"
+          && request.resource.data.status == "cancelled"
+          && request.resource.data.diff(resource.data).changedKeys().hasOnly(["status", "updatedAt"]);
+      }
+
+      // Курьер меняет свой offer accept/decline как и раньше.
+      allow update: if signedIn() && (
+        (isCourier() && resource.data.courierId == request.auth.uid)
+        || restaurantCanExpireOffer()
+        || restaurantCanCancelOffer()
+      );
 
       allow delete: if false;
     }
