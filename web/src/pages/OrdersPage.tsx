@@ -1,5 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { onAuthStateChanged } from "firebase/auth";
+import { OrderChat } from "../components/OrderChat";
+
 import {
     collection,
     onSnapshot,
@@ -107,6 +109,11 @@ export function OrdersPage() {
     const [error, setError] = useState<string>("");
     const [tab, setTab] = useState<"active" | "completed" | "cancelled">("active");
     const [busyAction, setBusyAction] = useState<string | null>(null);
+    const [chatOpenByOrderId, setChatOpenByOrderId] = useState<Record<string, boolean>>({});
+
+    function toggleChat(orderId: string) {
+        setChatOpenByOrderId((prev) => ({ ...prev, [orderId]: !prev[orderId] }));
+    }
 
     useEffect(() => {
         const unsub = onAuthStateChanged(auth, (u) => setUid(u?.uid ?? null));
@@ -326,6 +333,7 @@ export function OrdersPage() {
             <div className="stack">
                 {filteredOrders.map((o) => {
                     const isCash = o.paymentType === "cash";
+                    const chatId = o.assignedCourierId ? `${o.id}_${o.assignedCourierId}` : null;
 
                     return (
                         <div key={o.id} className="card">
@@ -429,6 +437,21 @@ export function OrdersPage() {
                                             >
                                                 {busyAction === `remove:${o.id}` ? "Removing…" : "Remove courier"}
                                             </button>
+                                        )}
+                                        {chatId && (
+                                            <button className="btn btn--ghost" onClick={() => toggleChat(o.id)}>
+                                                {chatOpenByOrderId[o.id] ? "Hide chat" : "Chat"}
+                                            </button>
+                                        )}
+                                        {chatId && chatOpenByOrderId[o.id] && (
+                                            <OrderChat
+                                                chatId={chatId}
+                                                orderId={o.id}
+                                                restaurantId={uid}
+                                                courierId={o.assignedCourierId!}
+                                                myRole="restaurant"
+                                                disabled={o.status === "cancelled" || !o.assignedCourierId}
+                                            />
                                         )}
 
                                         {o.assignedCourierId && (

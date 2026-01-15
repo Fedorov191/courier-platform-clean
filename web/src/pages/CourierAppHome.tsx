@@ -1,5 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { auth, db } from "../lib/firebase";
+import { OrderChat } from "../components/OrderChat";
+
 import {
     collection,
     doc,
@@ -152,6 +154,11 @@ export default function CourierAppHome() {
 
     const [busyOfferId, setBusyOfferId] = useState<string | null>(null);
     const [busyOrderAction, setBusyOrderAction] = useState<"pickup" | "deliver" | null>(null);
+    const [chatOpenByOrderId, setChatOpenByOrderId] = useState<Record<string, boolean>>({});
+
+    function toggleChat(orderId: string) {
+        setChatOpenByOrderId((prev) => ({ ...prev, [orderId]: !prev[orderId] }));
+    }
 
     // ensure courier docs
     useEffect(() => {
@@ -707,6 +714,20 @@ export default function CourierAppHome() {
                                                             Яндекс
                                                         </a>
                                                     )}
+                                                    <button className="btn btn--ghost" onClick={() => toggleChat(ord.id)}>
+                                                        {chatOpenByOrderId[ord.id] ? "Hide chat" : "Chat"}
+                                                    </button>
+                                                    {chatOpenByOrderId[ord.id] && (
+                                                        <OrderChat
+                                                            chatId={`${ord.id}_${user.uid}`}
+                                                            orderId={ord.id}
+                                                            restaurantId={String(ord.restaurantId ?? "")}
+                                                            courierId={user.uid}
+                                                            myRole="courier"
+                                                            disabled={ord.status === "cancelled"}
+                                                        />
+                                                    )}
+
                                                 </div>
 
                                                 {!canDeliver && (

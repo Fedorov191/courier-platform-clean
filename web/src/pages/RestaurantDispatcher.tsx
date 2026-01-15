@@ -14,6 +14,7 @@ import {
 } from "firebase/firestore";
 
 const OFFER_TIMEOUT_MS = 25_000;
+// @ts-ignore
 const REOFFER_SAME_COURIER_COOLDOWN_MS = 20_000; // пауза перед повтором тому же курьеру
 
 const ONLINE_STALE_MS = 2 * 60_000;
