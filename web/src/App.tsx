@@ -10,6 +10,10 @@ import { AppLayout } from "./pages/AppLayout";
 import { OrdersPage } from "./pages/OrdersPage";
 import { NewOrderPage } from "./pages/NewOrderPage";
 
+// ✅ NEW: Reports pages
+import { RestaurantReportsPage } from "./pages/RestaurantReportsPage";
+import { CourierReportsPage } from "./pages/CourierReportsPage";
+
 // ---------- Courier ----------
 import CourierLoginPage from "./pages/CourierLoginPage";
 import CourierSignupPage from "./pages/CourierSignupPage";
@@ -33,6 +37,9 @@ export default function App() {
                     <Route index element={<Navigate to="/restaurant/app/orders" replace />} />
                     <Route path="orders" element={<OrdersPage />} />
                     <Route path="orders/new" element={<NewOrderPage />} />
+
+                    {/* ✅ NEW */}
+                    <Route path="reports" element={<RestaurantReportsPage />} />
                 </Route>
             </Route>
 
@@ -42,6 +49,9 @@ export default function App() {
 
             <Route element={<RoleRoute role="courier" />}>
                 <Route path="/courier/app" element={<CourierAppHome />} />
+
+                {/* ✅ NEW */}
+                <Route path="/courier/app/reports" element={<CourierReportsPage />} />
             </Route>
 
             {/* =================== LEGACY REDIRECTS (важно!) =================== */}

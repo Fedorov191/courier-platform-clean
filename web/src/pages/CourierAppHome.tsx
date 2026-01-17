@@ -17,6 +17,8 @@ import { signOut } from "firebase/auth";
 import { useNavigate } from "react-router-dom";
 import { geohashForLocation } from "geofire-common";
 
+type Role = "courier" | "restaurant";
+
 type Offer = {
     id: string;
     orderId: string;
@@ -50,8 +52,12 @@ type Offer = {
     shortCode?: string;
     publicCode?: string;
     codeDateKey?: string;
-
 };
+
+function shortId(id: string) {
+    return (id || "").slice(0, 6).toUpperCase();
+}
+
 function israelDateKey(d = new Date()) {
     const parts = new Intl.DateTimeFormat("en-CA", {
         timeZone: "Asia/Jerusalem",
@@ -64,18 +70,6 @@ function israelDateKey(d = new Date()) {
     const m = parts.find((p) => p.type === "month")?.value ?? "00";
     const day = parts.find((p) => p.type === "day")?.value ?? "00";
     return `${y}-${m}-${day}`; // YYYY-MM-DD
-}
-
-function israelMonthKey(d = new Date()) {
-    return israelDateKey(d).slice(0, 7); // YYYY-MM
-}
-
-function israelYearKey(d = new Date()) {
-    return israelDateKey(d).slice(0, 4); // YYYY
-}
-
-function shortId(id: string) {
-    return (id || "").slice(0, 6).toUpperCase();
 }
 
 function money(n?: number) {
@@ -101,8 +95,8 @@ function googleMapsUrl(lat?: number, lng?: number) {
 const MAX_ACTIVE_ORDERS = 3;
 const MAX_PENDING_OFFERS = 3;
 
-const GEO_WRITE_MIN_MS = 60_000; // пишем в Firestore не чаще 1 раза/мин
-const GEO_MIN_MOVE_M = 150; // или если сдвиг > 150 метров
+const GEO_WRITE_MIN_MS = 60_000; // Firestore write <= 1/min
+const GEO_MIN_MOVE_M = 150;      // or if moved >= 150m
 
 function haversineMeters(lat1: number, lon1: number, lat2: number, lon2: number) {
     const R = 6371000;
@@ -155,7 +149,6 @@ export default function CourierAppHome() {
     const watchId = useRef<number | null>(null);
     const heartbeatId = useRef<number | null>(null);
 
-
     const lastGeoWriteMsRef = useRef<number>(0);
     const lastGeoRef = useRef<{ lat: number; lng: number } | null>(null);
     const geoWriteInFlightRef = useRef(false);
@@ -182,15 +175,22 @@ export default function CourierAppHome() {
     const [busyOfferId, setBusyOfferId] = useState<string | null>(null);
     const [busyOrderAction, setBusyOrderAction] = useState<"pickup" | "deliver" | null>(null);
     const [chatOpenByOrderId, setChatOpenByOrderId] = useState<Record<string, boolean>>({});
+
+    function toggleChat(orderId: string) {
+        setChatOpenByOrderId((prev) => ({ ...prev, [orderId]: !prev[orderId] }));
+    }
+
+    // =======================
+    // AUDIO: beep каждую секунду пока есть offers
+    // =======================
     const audioCtxRef = useRef<AudioContext | null>(null);
 
     function primeAudio() {
-        const A = (window.AudioContext || (window as any).webkitAudioContext);
+        const A = window.AudioContext || (window as any).webkitAudioContext;
         if (!A) return;
 
-        if (!audioCtxRef.current) {
-            audioCtxRef.current = new A();
-        }
+        if (!audioCtxRef.current) audioCtxRef.current = new A();
+
         if (audioCtxRef.current.state === "suspended") {
             audioCtxRef.current.resume().catch(() => {});
         }
@@ -200,36 +200,35 @@ export default function CourierAppHome() {
         const ctx = audioCtxRef.current;
         if (!ctx) return;
 
+        // если вдруг подвис — пробуем возобновить
+        if (ctx.state === "suspended") {
+            ctx.resume().catch(() => {});
+            return;
+        }
+
         const osc = ctx.createOscillator();
         const gain = ctx.createGain();
 
         osc.type = "sine";
-        osc.frequency.value = 880;   // тон
-        gain.gain.value = 0.05;      // громкость (можно поднять до 0.1)
+        osc.frequency.value = 880;
+        gain.gain.value = 0.05;
 
         osc.connect(gain);
         gain.connect(ctx.destination);
 
         const t0 = ctx.currentTime;
         osc.start(t0);
-        osc.stop(t0 + 0.08);         // 80ms
+        osc.stop(t0 + 0.08);
     }
+
     useEffect(() => {
         if (!isOnline) return;
         if (offers.length === 0) return;
 
-        // сразу пикнем
         playBeep();
-
-        const id = window.setInterval(() => {
-            playBeep();
-        }, 1000);
-
+        const id = window.setInterval(() => playBeep(), 1000);
         return () => window.clearInterval(id);
     }, [isOnline, offers.length]);
-    function toggleChat(orderId: string) {
-        setChatOpenByOrderId((prev) => ({ ...prev, [orderId]: !prev[orderId] }));
-    }
 
     // ensure courier docs
     useEffect(() => {
@@ -240,7 +239,11 @@ export default function CourierAppHome() {
 
             try {
                 await setDoc(courierPrivateRef, { updatedAt: serverTimestamp() }, { merge: true });
-                await setDoc(courierPublicRef, { courierId: user.uid, updatedAt: serverTimestamp() }, { merge: true });
+                await setDoc(
+                    courierPublicRef,
+                    { courierId: user.uid, updatedAt: serverTimestamp() },
+                    { merge: true }
+                );
             } catch (e: any) {
                 if (!cancelled) setErr(e?.message ?? "Failed to init courier docs");
             }
@@ -303,7 +306,6 @@ export default function CourierAppHome() {
                     };
                 });
 
-                // UI-лимит (по ТЗ максимум офферов)
                 setOffers(list.slice(0, MAX_PENDING_OFFERS));
             },
             (e: any) => setErr(e?.message ?? "Failed to load offers")
@@ -324,10 +326,7 @@ export default function CourierAppHome() {
 
         const unsub = onSnapshot(
             q,
-            (snap) => {
-                const list = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
-                setActiveOrders(list);
-            },
+            (snap) => setActiveOrders(snap.docs.map((d) => ({ id: d.id, ...d.data() }))),
             (e: any) => setErr(e?.message ?? "Failed to load active orders")
         );
 
@@ -349,7 +348,6 @@ export default function CourierAppHome() {
             (snap) => {
                 const list = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
 
-                // сортировка по deliveredAt (если есть), чтобы новые были сверху
                 list.sort((a: any, b: any) => {
                     const ta = a?.deliveredAt?.seconds ?? 0;
                     const tb = b?.deliveredAt?.seconds ?? 0;
@@ -409,10 +407,7 @@ export default function CourierAppHome() {
             return;
         }
 
-        // Heartbeat: обновляем lastSeenAt раз в минуту даже если позиция не меняется
-        if (heartbeatId.current !== null) {
-            window.clearInterval(heartbeatId.current);
-        }
+        if (heartbeatId.current !== null) window.clearInterval(heartbeatId.current);
 
         heartbeatId.current = window.setInterval(async () => {
             try {
@@ -436,7 +431,6 @@ export default function CourierAppHome() {
 
                 lastGeoWriteMsRef.current = now;
             } catch {
-                // heartbeat не должен ломать UI ошибками
             } finally {
                 geoWriteInFlightRef.current = false;
             }
@@ -450,7 +444,6 @@ export default function CourierAppHome() {
                 const prev = lastGeoRef.current;
                 const moved = prev ? haversineMeters(prev.lat, prev.lng, latitude, longitude) : Infinity;
 
-                // сохраняем последнюю позицию всегда
                 lastGeoRef.current = { lat: latitude, lng: longitude };
 
                 const elapsed = now - lastGeoWriteMsRef.current;
@@ -498,6 +491,7 @@ export default function CourierAppHome() {
                 if (!orderSnap.exists()) throw new Error("Order not found");
 
                 const orderData: any = orderSnap.data();
+
                 if (orderData.status === "cancelled" || orderData.status === "delivered") {
                     tx.update(offerRef, { status: "declined", updatedAt: serverTimestamp() });
                     throw new Error("Order is no longer available");
@@ -554,18 +548,12 @@ export default function CourierAppHome() {
     async function markDelivered(orderId: string) {
         setBusyOrderAction("deliver");
         try {
-            const dKey = israelDateKey();
-            const mKey = dKey.slice(0, 7);
-            const yKey = dKey.slice(0, 4);
-
             await updateDoc(doc(db, "orders", orderId), {
                 status: "delivered",
                 deliveredAt: serverTimestamp(),
 
-                // ✅ ключи для отчётов (Israel TZ)
-                deliveredDateKey: dKey,
-                deliveredMonthKey: mKey,
-                deliveredYearKey: yKey,
+                // ✅ A4.3: ключ даты доставки (Israel TZ) для отчётов
+                deliveredDateKey: israelDateKey(),
 
                 updatedAt: serverTimestamp(),
             });
@@ -573,7 +561,6 @@ export default function CourierAppHome() {
             setBusyOrderAction(null);
         }
     }
-
 
     async function logout() {
         if (activeOrders.length > 0) {
@@ -612,7 +599,7 @@ export default function CourierAppHome() {
                                     Courier Console
                                 </div>
                                 <div className="muted" style={{ marginTop: 6 }}>
-                                    Your work dashboard — offers, active order, delivery steps.
+                                    Your work dashboard — offers, active orders, delivery steps.
                                 </div>
                             </div>
 
@@ -624,7 +611,7 @@ export default function CourierAppHome() {
                                 <button
                                     className="btn btn--success"
                                     onClick={() => {
-                                        primeAudio();     // ✅ важно: в момент user gesture
+                                        primeAudio(); // ✅ важно: user gesture
                                         setOnline(true);
                                     }}
                                     disabled={isOnline}
@@ -632,9 +619,12 @@ export default function CourierAppHome() {
                                     Go online
                                 </button>
 
-
                                 <button className="btn" onClick={() => setOnline(false)} disabled={!isOnline || hasActive}>
                                     Go offline
+                                </button>
+
+                                <button className="btn btn--ghost" onClick={() => nav("/courier/app/reports")}>
+                                    Reports
                                 </button>
 
                                 <button className="btn btn--ghost" onClick={logout} disabled={hasActive}>
@@ -656,17 +646,11 @@ export default function CourierAppHome() {
                 <div className="card">
                     <div className="card__inner">
                         <div className="row row--wrap">
-                            <button
-                                className={`btn ${tab === "active" ? "btn--primary" : "btn--ghost"}`}
-                                onClick={() => setTab("active")}
-                            >
+                            <button className={`btn ${tab === "active" ? "btn--primary" : "btn--ghost"}`} onClick={() => setTab("active")}>
                                 Активные
                             </button>
 
-                            <button
-                                className={`btn ${tab === "completed" ? "btn--primary" : "btn--ghost"}`}
-                                onClick={() => setTab("completed")}
-                            >
+                            <button className={`btn ${tab === "completed" ? "btn--primary" : "btn--ghost"}`} onClick={() => setTab("completed")}>
                                 Выполненные <span className="pill pill--muted">{completedOrders.length}</span>
                             </button>
                         </div>
@@ -676,9 +660,9 @@ export default function CourierAppHome() {
                 {/* ACTIVE TAB */}
                 {tab === "active" && (
                     <>
-                        {/* Active orders */}
                         <div style={{ height: 12 }} />
 
+                        {/* Active orders */}
                         {activeOrders.length > 0 && (
                             <div className="stack">
                                 {activeOrders.slice(0, MAX_ACTIVE_ORDERS).map((ord: any) => {
@@ -686,7 +670,6 @@ export default function CourierAppHome() {
                                     const canPickup = st === "taken";
                                     const canDeliver = st === "picked_up";
 
-                                    // ✅ 3-значный код (fallback на короткий id)
                                     const code =
                                         typeof ord?.shortCode === "string" && ord.shortCode
                                             ? ord.shortCode
@@ -712,17 +695,17 @@ export default function CourierAppHome() {
                                                         </div>
 
                                                         <span className={`pill pill--${pillToneForOrderStatus(ord.status)}`}>
-                  {labelForOrderStatus(ord.status)}
-                </span>
+                              {labelForOrderStatus(ord.status)}
+                            </span>
                                                     </div>
 
                                                     <div className="row row--wrap">
-                <span className={`pill ${st === "taken" ? "pill--warning" : "pill--success"}`}>
-                  1 · TAKEN
-                </span>
+                            <span className={`pill ${st === "taken" ? "pill--warning" : "pill--success"}`}>
+                              1 · TAKEN
+                            </span>
                                                         <span className={`pill ${st === "picked_up" ? "pill--info" : "pill--muted"}`}>
-                  2 · PICKED UP
-                </span>
+                              2 · PICKED UP
+                            </span>
                                                         <span className="pill pill--muted">3 · DELIVERED</span>
                                                     </div>
                                                 </div>
@@ -842,8 +825,6 @@ export default function CourierAppHome() {
                             </div>
                         )}
 
-
-
                         {/* Offers */}
                         <div style={{ height: 12 }} />
 
@@ -872,13 +853,11 @@ export default function CourierAppHome() {
 
                                 <div className="stack">
                                     {offers.map((o) => {
-                                        const pickupMain =
-                                            wazeUrl(o.pickupLat, o.pickupLng) ?? googleMapsUrl(o.pickupLat, o.pickupLng);
+                                        const pickupMain = wazeUrl(o.pickupLat, o.pickupLng) ?? googleMapsUrl(o.pickupLat, o.pickupLng);
                                         const pickupYandex = yandexMapsUrl(o.pickupLat, o.pickupLng);
 
                                         const isBusy = busyOfferId === o.id;
 
-                                        // ✅ ВОТ ТУТ вычисляем код (до return)
                                         const offerCode =
                                             typeof o.shortCode === "string" && o.shortCode
                                                 ? o.shortCode
@@ -893,8 +872,8 @@ export default function CourierAppHome() {
                                                         </div>
 
                                                         <span className={`pill ${o.paymentType === "cash" ? "pill--muted" : "pill--info"}`}>
-            {(o.paymentType ?? "—").toUpperCase()}
-          </span>
+                              {(o.paymentType ?? "—").toUpperCase()}
+                            </span>
 
                                                         <span className="pill pill--success">Fee {money(o.deliveryFee)}</span>
                                                     </div>
@@ -991,13 +970,10 @@ export default function CourierAppHome() {
 
                                 <div className="hr" />
 
-                                {completedOrders.length === 0 && (
-                                    <div className="muted">Пока нет выполненных заказов</div>
-                                )}
+                                {completedOrders.length === 0 && <div className="muted">Пока нет выполненных заказов</div>}
 
                                 <div className="stack">
                                     {completedOrders.map((o: any) => {
-                                        // ✅ 3-значный код (fallback на короткий id)
                                         const code =
                                             typeof o?.shortCode === "string" && o.shortCode
                                                 ? o.shortCode
@@ -1041,7 +1017,6 @@ export default function CourierAppHome() {
                                         );
                                     })}
                                 </div>
-
 
                                 <div className="muted" style={{ marginTop: 12, fontSize: 12 }}>
                                     Delivered orders are shown here.

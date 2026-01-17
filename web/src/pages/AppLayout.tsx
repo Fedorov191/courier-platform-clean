@@ -29,6 +29,9 @@ export function AppLayout() {
                                     <NavLink to="/restaurant/app/orders/new" className={linkClass}>
                                         New order
                                     </NavLink>
+                                    <NavLink to="/restaurant/app/reports" className={linkClass}>
+                                        Reports
+                                    </NavLink>
                                 </nav>
                             </div>
 
