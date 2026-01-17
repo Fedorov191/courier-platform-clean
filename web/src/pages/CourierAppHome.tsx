@@ -46,6 +46,11 @@ type Offer = {
     courierPaysAtPickup?: number;
     courierCollectsFromCustomer?: number;
     courierGetsFromRestaurantAtPickup?: number;
+
+    shortCode?: string;
+    publicCode?: string;
+    codeDateKey?: string;
+
 };
 
 function shortId(id: string) {
@@ -129,6 +134,7 @@ export default function CourierAppHome() {
     const watchId = useRef<number | null>(null);
     const heartbeatId = useRef<number | null>(null);
 
+
     const lastGeoWriteMsRef = useRef<number>(0);
     const lastGeoRef = useRef<{ lat: number; lng: number } | null>(null);
     const geoWriteInFlightRef = useRef(false);
@@ -155,7 +161,51 @@ export default function CourierAppHome() {
     const [busyOfferId, setBusyOfferId] = useState<string | null>(null);
     const [busyOrderAction, setBusyOrderAction] = useState<"pickup" | "deliver" | null>(null);
     const [chatOpenByOrderId, setChatOpenByOrderId] = useState<Record<string, boolean>>({});
+    const audioCtxRef = useRef<AudioContext | null>(null);
 
+    function primeAudio() {
+        const A = (window.AudioContext || (window as any).webkitAudioContext);
+        if (!A) return;
+
+        if (!audioCtxRef.current) {
+            audioCtxRef.current = new A();
+        }
+        if (audioCtxRef.current.state === "suspended") {
+            audioCtxRef.current.resume().catch(() => {});
+        }
+    }
+
+    function playBeep() {
+        const ctx = audioCtxRef.current;
+        if (!ctx) return;
+
+        const osc = ctx.createOscillator();
+        const gain = ctx.createGain();
+
+        osc.type = "sine";
+        osc.frequency.value = 880;   // тон
+        gain.gain.value = 0.05;      // громкость (можно поднять до 0.1)
+
+        osc.connect(gain);
+        gain.connect(ctx.destination);
+
+        const t0 = ctx.currentTime;
+        osc.start(t0);
+        osc.stop(t0 + 0.08);         // 80ms
+    }
+    useEffect(() => {
+        if (!isOnline) return;
+        if (offers.length === 0) return;
+
+        // сразу пикнем
+        playBeep();
+
+        const id = window.setInterval(() => {
+            playBeep();
+        }, 1000);
+
+        return () => window.clearInterval(id);
+    }, [isOnline, offers.length]);
     function toggleChat(orderId: string) {
         setChatOpenByOrderId((prev) => ({ ...prev, [orderId]: !prev[orderId] }));
     }
@@ -202,6 +252,10 @@ export default function CourierAppHome() {
                         restaurantId: String(data.restaurantId ?? ""),
                         courierId: String(data.courierId ?? ""),
                         status: String(data.status ?? "pending"),
+
+                        shortCode: data.shortCode,
+                        publicCode: data.publicCode,
+                        codeDateKey: data.codeDateKey,
 
                         customerName: data.customerName,
                         customerPhone: data.customerPhone,
@@ -535,9 +589,17 @@ export default function CourierAppHome() {
                   {isOnline ? "● ONLINE" : "● OFFLINE"}
                 </span>
 
-                                <button className="btn btn--success" onClick={() => setOnline(true)} disabled={isOnline}>
+                                <button
+                                    className="btn btn--success"
+                                    onClick={() => {
+                                        primeAudio();     // ✅ важно: в момент user gesture
+                                        setOnline(true);
+                                    }}
+                                    disabled={isOnline}
+                                >
                                     Go online
                                 </button>
+
 
                                 <button className="btn" onClick={() => setOnline(false)} disabled={!isOnline || hasActive}>
                                     Go offline
@@ -592,6 +654,12 @@ export default function CourierAppHome() {
                                     const canPickup = st === "taken";
                                     const canDeliver = st === "picked_up";
 
+                                    // ✅ 3-значный код (fallback на короткий id)
+                                    const code =
+                                        typeof ord?.shortCode === "string" && ord.shortCode
+                                            ? ord.shortCode
+                                            : shortId(ord.id);
+
                                     const pickupMain =
                                         wazeUrl(ord?.pickupLat, ord?.pickupLng) ??
                                         googleMapsUrl(ord?.pickupLat, ord?.pickupLng);
@@ -608,20 +676,21 @@ export default function CourierAppHome() {
                                                 <div className="row row--between row--wrap">
                                                     <div className="row row--wrap">
                                                         <div style={{ fontWeight: 950, fontSize: 16 }}>
-                                                            Active order <span className="mono">#{shortId(ord.id)}</span>
+                                                            Active order <span className="mono">#{code}</span>
                                                         </div>
+
                                                         <span className={`pill pill--${pillToneForOrderStatus(ord.status)}`}>
-                              {labelForOrderStatus(ord.status)}
-                            </span>
+                  {labelForOrderStatus(ord.status)}
+                </span>
                                                     </div>
 
                                                     <div className="row row--wrap">
-                            <span className={`pill ${st === "taken" ? "pill--warning" : "pill--success"}`}>
-                              1 · TAKEN
-                            </span>
+                <span className={`pill ${st === "taken" ? "pill--warning" : "pill--success"}`}>
+                  1 · TAKEN
+                </span>
                                                         <span className={`pill ${st === "picked_up" ? "pill--info" : "pill--muted"}`}>
-                              2 · PICKED UP
-                            </span>
+                  2 · PICKED UP
+                </span>
                                                         <span className="pill pill--muted">3 · DELIVERED</span>
                                                     </div>
                                                 </div>
@@ -691,7 +760,6 @@ export default function CourierAppHome() {
                                                         {busyOrderAction === "deliver" ? "Saving…" : "Доставлено"}
                                                     </button>
 
-                                                    {/* До pickup (taken) показываем маршрут в ресторан */}
                                                     {canPickup && pickupMain && (
                                                         <a className="btn btn--ghost" href={pickupMain} target="_blank" rel="noreferrer">
                                                             Маршрут в ресторан
@@ -703,7 +771,6 @@ export default function CourierAppHome() {
                                                         </a>
                                                     )}
 
-                                                    {/* После pickup (picked_up) показываем маршрут к клиенту */}
                                                     {canDeliver && dropoffMain && (
                                                         <a className="btn btn--ghost" href={dropoffMain} target="_blank" rel="noreferrer">
                                                             Маршрут к клиенту
@@ -714,9 +781,11 @@ export default function CourierAppHome() {
                                                             Яндекс
                                                         </a>
                                                     )}
+
                                                     <button className="btn btn--ghost" onClick={() => toggleChat(ord.id)}>
                                                         {chatOpenByOrderId[ord.id] ? "Hide chat" : "Chat"}
                                                     </button>
+
                                                     {chatOpenByOrderId[ord.id] && (
                                                         <OrderChat
                                                             chatId={`${ord.id}_${user.uid}`}
@@ -727,7 +796,6 @@ export default function CourierAppHome() {
                                                             disabled={ord.status === "cancelled"}
                                                         />
                                                     )}
-
                                                 </div>
 
                                                 {!canDeliver && (
@@ -741,6 +809,8 @@ export default function CourierAppHome() {
                                 })}
                             </div>
                         )}
+
+
 
                         {/* Offers */}
                         <div style={{ height: 12 }} />
@@ -771,23 +841,28 @@ export default function CourierAppHome() {
                                 <div className="stack">
                                     {offers.map((o) => {
                                         const pickupMain =
-                                            wazeUrl(o.pickupLat, o.pickupLng) ??
-                                            googleMapsUrl(o.pickupLat, o.pickupLng);
+                                            wazeUrl(o.pickupLat, o.pickupLng) ?? googleMapsUrl(o.pickupLat, o.pickupLng);
                                         const pickupYandex = yandexMapsUrl(o.pickupLat, o.pickupLng);
 
                                         const isBusy = busyOfferId === o.id;
+
+                                        // ✅ ВОТ ТУТ вычисляем код (до return)
+                                        const offerCode =
+                                            typeof o.shortCode === "string" && o.shortCode
+                                                ? o.shortCode
+                                                : shortId(o.orderId);
 
                                         return (
                                             <div key={o.id} className="subcard">
                                                 <div className="row row--between row--wrap">
                                                     <div className="row row--wrap">
                                                         <div style={{ fontWeight: 950 }}>
-                                                            Order <span className="mono">#{shortId(o.orderId)}</span>
+                                                            Order <span className="mono">#{offerCode}</span>
                                                         </div>
 
                                                         <span className={`pill ${o.paymentType === "cash" ? "pill--muted" : "pill--info"}`}>
-                              {(o.paymentType ?? "—").toUpperCase()}
-                            </span>
+            {(o.paymentType ?? "—").toUpperCase()}
+          </span>
 
                                                         <span className="pill pill--success">Fee {money(o.deliveryFee)}</span>
                                                     </div>
@@ -889,43 +964,52 @@ export default function CourierAppHome() {
                                 )}
 
                                 <div className="stack">
-                                    {completedOrders.map((o: any) => (
-                                        <div key={o.id} className="subcard">
-                                            <div className="row row--between row--wrap">
-                                                <div style={{ fontWeight: 950 }}>
-                                                    Order <span className="mono">#{shortId(o.id)}</span>
+                                    {completedOrders.map((o: any) => {
+                                        // ✅ 3-значный код (fallback на короткий id)
+                                        const code =
+                                            typeof o?.shortCode === "string" && o.shortCode
+                                                ? o.shortCode
+                                                : shortId(o.id);
+
+                                        return (
+                                            <div key={o.id} className="subcard">
+                                                <div className="row row--between row--wrap">
+                                                    <div style={{ fontWeight: 950 }}>
+                                                        Order <span className="mono">#{code}</span>
+                                                    </div>
+                                                    <span className="pill pill--success">DELIVERED</span>
                                                 </div>
-                                                <span className="pill pill--success">DELIVERED</span>
+
+                                                <div style={{ height: 10 }} />
+
+                                                <div className="kv">
+                                                    <div className="line">
+                                                        <span>Customer</span>
+                                                        <b>{o.customerName ?? "—"}</b>
+                                                    </div>
+
+                                                    <div className="line" style={{ alignItems: "baseline" }}>
+                                                        <span>Address</span>
+                                                        <b style={{ textAlign: "right" }}>
+                                                            {o.dropoffAddressText ?? o.customerAddress ?? "—"}
+                                                        </b>
+                                                    </div>
+
+                                                    <div className="line">
+                                                        <span>Total</span>
+                                                        <b>{money(o.orderTotal)}</b>
+                                                    </div>
+
+                                                    <div className="line">
+                                                        <span>Your fee</span>
+                                                        <b>{money(o.deliveryFee)}</b>
+                                                    </div>
+                                                </div>
                                             </div>
-
-                                            <div style={{ height: 10 }} />
-
-                                            <div className="kv">
-                                                <div className="line">
-                                                    <span>Customer</span>
-                                                    <b>{o.customerName ?? "—"}</b>
-                                                </div>
-
-                                                <div className="line" style={{ alignItems: "baseline" }}>
-                                                    <span>Address</span>
-                                                    <b style={{ textAlign: "right" }}>
-                                                        {o.dropoffAddressText ?? o.customerAddress ?? "—"}
-                                                    </b>
-                                                </div>
-
-                                                <div className="line">
-                                                    <span>Total</span>
-                                                    <b>{money(o.orderTotal)}</b>
-                                                </div>
-
-                                                <div className="line">
-                                                    <span>Your fee</span>
-                                                    <b>{money(o.deliveryFee)}</b>
-                                                </div>
-                                            </div>
-                                        </div>
-                                    ))}
+                                        );
+                                    })}
                                 </div>
+
 
                                 <div className="muted" style={{ marginTop: 12, fontSize: 12 }}>
                                     Delivered orders are shown here.

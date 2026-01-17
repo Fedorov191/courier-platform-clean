@@ -50,6 +50,9 @@ service cloud.firestore {
     match /restaurants/{restaurantId} {
       allow read, write: if signedIn() && request.auth.uid == restaurantId;
     }
+match /restaurants/{restaurantId}/dayCounters/{dateKey} {
+  allow read, write: if signedIn() && request.auth.uid == restaurantId;
+}
 
     // ----------------------------
     // Couriers: только свой документ

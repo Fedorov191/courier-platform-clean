@@ -267,6 +267,10 @@ export function RestaurantDispatcher() {
                 courierId,
                 orderId: snap.id,
 
+                shortCode: o.shortCode ?? null,
+                publicCode: o.publicCode ?? null,
+                codeDateKey: o.codeDateKey ?? null,
+
                 pickupLat: o.pickupLat ?? null,
                 pickupLng: o.pickupLng ?? null,
                 pickupGeohash: o.pickupGeohash ?? null,

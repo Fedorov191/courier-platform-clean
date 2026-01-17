@@ -1,11 +1,12 @@
 import { useEffect, useMemo, useState } from "react";
 import {
-    addDoc,
+
     collection,
     serverTimestamp,
     doc,
     getDoc,
     setDoc,
+    runTransaction,
 } from "firebase/firestore";
 
 import { onAuthStateChanged } from "firebase/auth";
@@ -34,6 +35,19 @@ type Errors =
 
 function onlyDigits(s: string) {
     return s.replace(/\D/g, "");
+}
+function israelDateKey(d = new Date()) {
+    const parts = new Intl.DateTimeFormat("en-CA", {
+        timeZone: "Asia/Jerusalem",
+        year: "numeric",
+        month: "2-digit",
+        day: "2-digit",
+    }).formatToParts(d);
+
+    const y = parts.find((p) => p.type === "year")?.value ?? "0000";
+    const m = parts.find((p) => p.type === "month")?.value ?? "00";
+    const day = parts.find((p) => p.type === "day")?.value ?? "00";
+    return `${y}-${m}-${day}`; // YYYY-MM-DD
 }
 
 function toNumber(s: string) {
@@ -238,8 +252,46 @@ export function NewOrderPage() {
                 updatedAt: serverTimestamp(),
             };
 
-            // 1) Создаём заказ
-            await addDoc(collection(db, "orders"), orderDoc);
+            // 1) Создаём заказ + короткий код (3 цифры) атомарно
+            const dateKey = israelDateKey();
+            const orderRef = doc(collection(db, "orders"));
+            const counterRef = doc(db, "restaurants", uid, "dayCounters", dateKey);
+
+            await runTransaction(db, async (tx) => {
+                const counterSnap = await tx.get(counterRef);
+                const lastSeq = counterSnap.exists()
+                    ? Number((counterSnap.data() as any)?.lastSeq ?? 0)
+                    : 0;
+
+                const nextSeq = lastSeq + 1;
+
+                // защитный лимит (у тебя 1000/день “нереально”, но пусть будет)
+                if (nextSeq > 999) {
+                    throw new Error("Daily order limit reached (999).");
+                }
+
+                const shortCode = String(nextSeq).padStart(3, "0"); // "001"
+                const publicCode = `${dateKey}-${shortCode}`;       // "2026-01-15-001"
+
+                // обновляем счётчик дня
+                tx.set(
+                    counterRef,
+                    {
+                        lastSeq: nextSeq,
+                        updatedAt: serverTimestamp(),
+                    },
+                    { merge: true }
+                );
+
+                // пишем заказ с кодами
+                tx.set(orderRef, {
+                    ...orderDoc,
+                    shortCode,
+                    codeDateKey: dateKey,
+                    publicCode,
+                });
+            });
+
 
 
 

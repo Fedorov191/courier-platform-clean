@@ -24,6 +24,10 @@ type OrderDoc = {
     id: string;
     restaurantId: string;
 
+    shortCode?: string;
+    publicCode?: string;
+    codeDateKey?: string;
+
     pickupLat?: number;
     pickupLng?: number;
     pickupGeohash?: string;
@@ -143,9 +147,14 @@ export function OrdersPage() {
             (snap) => {
                 const list: OrderDoc[] = snap.docs.map((d) => {
                     const data = d.data() as any;
+
                     return {
                         id: d.id,
                         restaurantId: data.restaurantId,
+
+                        shortCode: typeof data.shortCode === "string" ? data.shortCode : undefined,
+                        publicCode: typeof data.publicCode === "string" ? data.publicCode : undefined,
+                        codeDateKey: typeof data.codeDateKey === "string" ? data.codeDateKey : undefined,
 
                         pickupLat: data.pickupLat,
                         pickupLng: data.pickupLng,
@@ -179,6 +188,7 @@ export function OrdersPage() {
                         createdAt: data.createdAt,
                     };
                 });
+
 
                 setOrders(list);
                 setLoading(false);
@@ -335,21 +345,27 @@ export function OrdersPage() {
                     const isCash = o.paymentType === "cash";
                     const chatId = o.assignedCourierId ? `${o.id}_${o.assignedCourierId}` : null;
 
+                    // ✅ ВОТ ТУТ вычисляем код (до return)
+                    const code =
+                        typeof (o as any).shortCode === "string" && (o as any).shortCode
+                            ? (o as any).shortCode
+                            : o.id.slice(0, 6).toUpperCase();
+
                     return (
                         <div key={o.id} className="card">
                             <div className="card__inner">
                                 <div className="row row--between row--wrap">
                                     <div style={{ fontWeight: 950 }}>
-                                        Order <span className="mono">#{o.id.slice(0, 6).toUpperCase()}</span>
+                                        Order <span className="mono">#{code}</span>
                                     </div>
 
                                     <div className="row row--wrap">
-                    <span className={`pill pill--${paymentTone(o.paymentType)}`}>
-                      {paymentLabel(o.paymentType)}
-                    </span>
+            <span className={`pill pill--${paymentTone(o.paymentType)}`}>
+              {paymentLabel(o.paymentType)}
+            </span>
                                         <span className={`pill pill--${statusTone(o.status)}`}>
-                      {statusLabel(o.status)}
-                    </span>
+              {statusLabel(o.status)}
+            </span>
                                     </div>
                                 </div>
 
