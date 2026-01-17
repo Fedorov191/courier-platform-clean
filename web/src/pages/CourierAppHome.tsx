@@ -52,6 +52,27 @@ type Offer = {
     codeDateKey?: string;
 
 };
+function israelDateKey(d = new Date()) {
+    const parts = new Intl.DateTimeFormat("en-CA", {
+        timeZone: "Asia/Jerusalem",
+        year: "numeric",
+        month: "2-digit",
+        day: "2-digit",
+    }).formatToParts(d);
+
+    const y = parts.find((p) => p.type === "year")?.value ?? "0000";
+    const m = parts.find((p) => p.type === "month")?.value ?? "00";
+    const day = parts.find((p) => p.type === "day")?.value ?? "00";
+    return `${y}-${m}-${day}`; // YYYY-MM-DD
+}
+
+function israelMonthKey(d = new Date()) {
+    return israelDateKey(d).slice(0, 7); // YYYY-MM
+}
+
+function israelYearKey(d = new Date()) {
+    return israelDateKey(d).slice(0, 4); // YYYY
+}
 
 function shortId(id: string) {
     return (id || "").slice(0, 6).toUpperCase();
@@ -533,15 +554,26 @@ export default function CourierAppHome() {
     async function markDelivered(orderId: string) {
         setBusyOrderAction("deliver");
         try {
+            const dKey = israelDateKey();
+            const mKey = dKey.slice(0, 7);
+            const yKey = dKey.slice(0, 4);
+
             await updateDoc(doc(db, "orders", orderId), {
                 status: "delivered",
                 deliveredAt: serverTimestamp(),
+
+                // ✅ ключи для отчётов (Israel TZ)
+                deliveredDateKey: dKey,
+                deliveredMonthKey: mKey,
+                deliveredYearKey: yKey,
+
                 updatedAt: serverTimestamp(),
             });
         } finally {
             setBusyOrderAction(null);
         }
     }
+
 
     async function logout() {
         if (activeOrders.length > 0) {

@@ -10,24 +10,29 @@ import {
     serverTimestamp,
     updateDoc,
     where,
-    type Timestamp,
+    Timestamp, // ✅ runtime Timestamp нужен для cleanupAt
+    type Timestamp as TimestampType,
 } from "firebase/firestore";
 
 const OFFER_TIMEOUT_MS = 25_000;
 // @ts-ignore
-const REOFFER_SAME_COURIER_COOLDOWN_MS = 20_000; // пауза перед повтором тому же курьеру
+const REOFFER_SAME_COURIER_COOLDOWN_MS = 20_000; // пауза перед повтором тому же курьеру (пока не используем)
 
 const ONLINE_STALE_MS = 2 * 60_000;
 
 const MAX_ACTIVE_ORDERS = 3;
 const MAX_PENDING_OFFERS = 3;
 
+// ✅ TTL retention (7 дней)
+const OFFER_RETENTION_DAYS = 7;
+const OFFER_RETENTION_MS = OFFER_RETENTION_DAYS * 24 * 60 * 60 * 1000;
+
 type CourierPublic = {
     id: string;
     isOnline?: boolean;
     lat?: number;
     lng?: number;
-    lastSeenAt?: Timestamp;
+    lastSeenAt?: TimestampType;
 
     // опционально (если ты позже начнёшь писать эти поля из courier app)
     activeOrdersCount?: number;
@@ -65,18 +70,17 @@ type OrderDoc = {
 
     lastOfferedCourierId?: string | null;
 
-    lastOfferedAt?: Timestamp;
+    lastOfferedAt?: TimestampType;
     offerExpiresAtMs?: number;
     currentOfferCourierId?: string | null;
     reofferAfterMs?: number;
-
 };
 
 type PendingOffer = {
     id: string;
     orderId: string;
     courierId: string;
-    createdAt?: Timestamp;
+    createdAt?: TimestampType;
 };
 
 function haversineMeters(lat1: number, lon1: number, lat2: number, lon2: number) {
@@ -91,7 +95,7 @@ function haversineMeters(lat1: number, lon1: number, lat2: number, lon2: number)
     return R * c;
 }
 
-function isFresh(ts?: Timestamp) {
+function isFresh(ts?: TimestampType) {
     if (!ts) return true;
     return Date.now() - ts.toMillis() <= ONLINE_STALE_MS;
 }
@@ -107,13 +111,12 @@ export function RestaurantDispatcher() {
     const inFlightOfferIds = useRef<Set<string>>(new Set());
     const dispatchTickInFlightRef = useRef(false);
 
-
     useEffect(() => {
         const unsub = onAuthStateChanged(auth, (u) => setUid(u?.uid ?? null));
         return () => unsub();
     }, []);
 
-    // 1) Все заказы текущего ресторана (диспетчеру нужно знать статус/assigned/cancelled)
+    // 1) Все заказы текущего ресторана
     useEffect(() => {
         if (!uid) return;
 
@@ -126,7 +129,7 @@ export function RestaurantDispatcher() {
         return () => unsub();
     }, [uid]);
 
-    // 2) Pending offers этого ресторана (чтобы знать “какие заказы сейчас уже предложены”)
+    // 2) Pending offers этого ресторана
     useEffect(() => {
         if (!uid) return;
 
@@ -197,7 +200,6 @@ export function RestaurantDispatcher() {
             if (typeof c.lat !== "number" || typeof c.lng !== "number") return false;
             if (!isFresh(c.lastSeenAt)) return false;
 
-            // Эти поля появятся, если ты захочешь (не обязательно для MVP)
             if ((c.activeOrdersCount ?? 0) >= MAX_ACTIVE_ORDERS) return false;
             if ((c.pendingOffersCount ?? 0) >= MAX_PENDING_OFFERS) return false;
 
@@ -220,8 +222,6 @@ export function RestaurantDispatcher() {
 
         if (sortedIds.length === 0) return null;
 
-        // “следующий после последнего” (циклом). Это даёт:
-        // nearest → declined/timeout → next nearest → ... → обратно к nearest
         const last = order.lastOfferedCourierId ?? null;
         if (!last) return sortedIds[0];
 
@@ -248,19 +248,21 @@ export function RestaurantDispatcher() {
             const nowMs = Date.now();
 
             // ✅ АНТИ-ДУБЛЬ: если мы уже предлагали оффер совсем недавно — НЕ создаём второй
-            // (это защищает от гонки orders-snapshot vs offers-snapshot, StrictMode и т.п.)
             const lastOfferedAtMs = o.lastOfferedAt?.toMillis?.();
             if (typeof lastOfferedAtMs === "number" && nowMs - lastOfferedAtMs < OFFER_TIMEOUT_MS - 500) {
                 return;
             }
 
-            // ✅ Доп. защита (если ты когда-то включишь Cloud Functions, которые пишут offerExpiresAtMs)
+            // ✅ Доп. защита, если offerExpiresAtMs ещё не истёк
             const expMs = typeof o.offerExpiresAtMs === "number" ? o.offerExpiresAtMs : null;
             if (expMs !== null && expMs > nowMs) {
                 return;
             }
 
             const expiresAtMs = nowMs + OFFER_TIMEOUT_MS;
+
+            // ✅ TTL поле: Firestore удалит offer примерно после этой даты (может быть задержка до ~24 часов)
+            const cleanupAt = Timestamp.fromMillis(nowMs + OFFER_RETENTION_MS);
 
             tx.set(offerRef, {
                 restaurantId,
@@ -295,7 +297,11 @@ export function RestaurantDispatcher() {
                 courierGetsFromRestaurantAtPickup: o.courierGetsFromRestaurantAtPickup ?? null,
 
                 status: "pending",
-                expiresAtMs, // удобно для дебага (и если захочешь фильтровать/чистить)
+                expiresAtMs,
+
+                // ✅ TTL timestamp field
+                cleanupAt,
+
                 createdAt: serverTimestamp(),
                 updatedAt: serverTimestamp(),
             });
@@ -305,13 +311,11 @@ export function RestaurantDispatcher() {
                 lastOfferedCourierId: courierId,
                 lastOfferedAt: serverTimestamp(),
 
-                // доп. поля-лок (чтобы разные “диспетчеры” не дублировали)
                 currentOfferCourierId: courierId,
                 offerExpiresAtMs: expiresAtMs,
                 reofferAfterMs: null,
+
                 updatedAt: serverTimestamp(),
-
-
             });
         });
     }
@@ -327,7 +331,6 @@ export function RestaurantDispatcher() {
                 const ord = orderById.get(off.orderId);
                 if (!ord) continue;
 
-                // если заказ отменён или уже назначен — pending оффер не должен висеть
                 const isAssigned = !!ord.assignedCourierId;
                 if (ord.status === "cancelled" || isAssigned) {
                     if (inFlightOfferIds.current.has(off.id)) continue;
@@ -337,8 +340,8 @@ export function RestaurantDispatcher() {
                             status: "cancelled",
                             updatedAt: serverTimestamp(),
                         });
-                    } catch {}
-                    finally {
+                    } catch {
+                    } finally {
                         inFlightOfferIds.current.delete(off.id);
                     }
                     continue;
@@ -347,7 +350,6 @@ export function RestaurantDispatcher() {
                 const createdMs = off.createdAt?.toMillis?.();
                 if (!createdMs) continue;
 
-                // маленький буфер, чтобы не стучаться в rules раньше времени
                 if (Date.now() - createdMs < OFFER_TIMEOUT_MS + 1000) continue;
 
                 if (inFlightOfferIds.current.has(off.id)) continue;
@@ -357,8 +359,8 @@ export function RestaurantDispatcher() {
                         status: "expired",
                         updatedAt: serverTimestamp(),
                     });
-                } catch {}
-                finally {
+                } catch {
+                } finally {
                     inFlightOfferIds.current.delete(off.id);
                 }
             }
@@ -391,7 +393,6 @@ export function RestaurantDispatcher() {
 
                     const courierId = pickCourierId(ord, usableCouriers);
 
-                    // нет курьеров онлайн — просто ждём
                     if (!courierId) {
                         if (ord.status === "offered") {
                             try {
@@ -409,8 +410,8 @@ export function RestaurantDispatcher() {
 
                     try {
                         await createOfferTx(uid, ord.id, courierId);
-                    } catch {}
-                    finally {
+                    } catch {
+                    } finally {
                         inFlightOrderIds.current.delete(ord.id);
                     }
                 }
@@ -419,7 +420,7 @@ export function RestaurantDispatcher() {
             }
         }
 
-        dispatchOnce(); // сразу
+        dispatchOnce();
         const id = window.setInterval(dispatchOnce, 2000);
 
         return () => {
@@ -427,7 +428,6 @@ export function RestaurantDispatcher() {
             window.clearInterval(id);
         };
     }, [uid, orders, pendingOfferByOrderId, usableCouriers]);
-
 
     return null;
 }
