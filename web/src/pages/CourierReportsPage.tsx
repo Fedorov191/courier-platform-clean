@@ -126,7 +126,7 @@ export function CourierReportsPage() {
                     <span className="pill pill--muted">Delivered only</span>
                 </div>
 
-                <div className="hr" />
+                 <div className="hr" />
 
                 <div className="row row--wrap row--mobile-stack" style={{ gap: 12 }}>
                     <label className="row row--wrap" style={{ gap: 8, alignItems: "center" }}>
