@@ -1,0 +1,533 @@
+import * as admin from "firebase-admin";
+import { FieldValue, Timestamp } from "firebase-admin/firestore";
+
+import { onDocumentCreated, onDocumentUpdated } from "firebase-functions/v2/firestore";
+import { onSchedule } from "firebase-functions/v2/scheduler";
+import { logger } from "firebase-functions";
+
+// ----------------------------
+// INIT
+// ----------------------------
+if (!admin.apps.length) {
+    admin.initializeApp();
+}
+const db = admin.firestore();
+
+// ----------------------------
+// CONFIG
+// ----------------------------
+
+// ⚠️ offer timeout (логика оффера)
+const OFFER_TIMEOUT_MS = 55_000;
+
+
+// courier online freshness
+const ONLINE_STALE_MS = 2 * 60_000;
+
+// offer retention (TTL уже включил в Firestore)
+const OFFER_RETENTION_DAYS = 7;
+const OFFER_RETENTION_MS = OFFER_RETENTION_DAYS * 24 * 60 * 60 * 1000;
+
+// лимиты (пока софт-логика, можно усилить позже)
+const MAX_ACTIVE_ORDERS = 3;
+const MAX_PENDING_OFFERS = 3;
+
+// сколько курьеров максимум читаем за раз (MVP)
+const COURIERS_LIMIT = 200;
+
+// сколько документов обрабатываем за тик
+const TICK_LIMIT = 200;
+
+// TTL field name (ВАЖНО: это имя ты выбираешь в Firestore TTL настройке)
+const TTL_FIELD = "cleanupAt"; // ✅ так и оставляем
+
+// ----------------------------
+// HELPERS
+// ----------------------------
+function haversineMeters(lat1: number, lon1: number, lat2: number, lon2: number) {
+    const R = 6371000;
+    const toRad = (d: number) => (d * Math.PI) / 180;
+    const dLat = toRad(lat2 - lat1);
+    const dLon = toRad(lon2 - lon1);
+    const a =
+        Math.sin(dLat / 2) ** 2 +
+        Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon / 2) ** 2;
+    const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+    return R * c;
+}
+
+function isFresh(ts?: Timestamp) {
+    if (!ts) return true;
+    return Date.now() - ts.toMillis() <= ONLINE_STALE_MS;
+}
+
+function isOpenOrderStatus(s?: string) {
+    return s === "new" || s === "offered";
+}
+
+type CourierPublic = {
+    id: string;
+    isOnline?: boolean;
+    lat?: number;
+    lng?: number;
+    lastSeenAt?: Timestamp;
+    activeOrdersCount?: number;
+    pendingOffersCount?: number;
+};
+
+function pickCourierId(order: any, candidates: CourierPublic[]): string | null {
+    const pickupLat = order?.pickupLat;
+    const pickupLng = order?.pickupLng;
+    if (typeof pickupLat !== "number" || typeof pickupLng !== "number") return null;
+
+    const sorted = candidates
+        .map((c) => ({
+            id: c.id,
+            dist: haversineMeters(pickupLat, pickupLng, c.lat as number, c.lng as number),
+        }))
+        .sort((a, b) => a.dist - b.dist)
+        .map((x) => x.id);
+
+    if (sorted.length === 0) return null;
+
+    const last = order?.lastOfferedCourierId ?? null;
+    if (!last) return sorted[0];
+
+    const idx = sorted.indexOf(last);
+    if (idx === -1) return sorted[0];
+    return sorted[(idx + 1) % sorted.length];
+}
+
+/**
+ * Главная функция: создать pending offer для order (если можно)
+ * - защищена транзакцией
+ * - не создаёт дубль, если уже есть активный offer (offerExpiresAtMs > now)
+ */
+async function dispatchOrder(orderId: string, reason: string) {
+    const nowMs = Date.now();
+    const orderRef = db.collection("orders").doc(orderId);
+
+    await db.runTransaction(async (tx) => {
+        const orderSnap = await tx.get(orderRef);
+        if (!orderSnap.exists) return;
+
+        const o: any = orderSnap.data();
+
+        // базовые проверки
+        if (!isOpenOrderStatus(o.status)) return;
+        if (o.assignedCourierId) return;
+        if (o.status === "cancelled" || o.status === "delivered") return;
+
+        // если уже есть активный оффер — не создаём новый
+        const exp = typeof o.offerExpiresAtMs === "number" ? o.offerExpiresAtMs : 0;
+        const hasActiveOffer =
+            exp > nowMs && typeof o.currentOfferId === "string" && o.currentOfferId;
+
+        if (hasActiveOffer) return;
+        // ✅ ВАЖНО: если lock уже протух, но старый offer ещё pending — закрываем его,
+        // иначе будут дубли pending офферов на один orderId
+        const prevOfferId =
+            typeof o.currentOfferId === "string" && o.currentOfferId ? o.currentOfferId : null;
+
+        if (prevOfferId) {
+            const prevOfferRef = db.collection("offers").doc(prevOfferId);
+            const prevOfferSnap = await tx.get(prevOfferRef);
+
+            if (prevOfferSnap.exists) {
+                const prev: any = prevOfferSnap.data();
+                const prevStatus = String(prev?.status ?? "");
+
+                // если вдруг order.offerExpiresAtMs сломан, но сам offer ещё жив — считаем его активным и выходим
+                const prevExp = Number(prev?.expiresAtMs ?? 0);
+                if (prevStatus === "pending" && prevExp > nowMs) {
+                    // подлечим order, чтобы не плодить новые
+                    tx.update(orderRef, {
+                        offerExpiresAtMs: prevExp,
+                        currentOfferCourierId: prev?.courierId ?? o.currentOfferCourierId ?? null,
+                        updatedAt: FieldValue.serverTimestamp(),
+                    });
+                    return;
+                }
+
+                // если pending и уже должен быть закрыт — закрываем
+                if (prevStatus === "pending") {
+                    tx.update(prevOfferRef, {
+                        status: "expired",
+                        updatedAt: FieldValue.serverTimestamp(),
+                        expiredBy: reason, // просто для дебага (можно убрать)
+                    });
+                }
+            }
+        }
+// ✅ HARD DEDUP: найдём любые pending offers по этому orderId
+        const offersSnap = await tx.get(
+            db.collection("offers")
+                .where("orderId", "==", orderId)
+                .limit(20)
+        );
+
+        const pending = offersSnap.docs
+            .map((d) => ({ id: d.id, ref: d.ref, data: d.data() as any }))
+            .filter((x) => String(x.data?.status ?? "") === "pending");
+
+// 1) Если есть pending, который ещё НЕ истёк — считаем его активным и выходим
+        const activePending = pending.find((x) => Number(x.data?.expiresAtMs ?? 0) > nowMs);
+
+        if (activePending) {
+            tx.update(orderRef, {
+                status: "offered",
+                currentOfferId: activePending.id,
+                currentOfferCourierId: activePending.data?.courierId ?? null,
+                offerExpiresAtMs: Number(activePending.data?.expiresAtMs ?? null),
+                updatedAt: FieldValue.serverTimestamp(),
+            });
+            return;
+        }
+
+// 2) Если pending есть, но уже протухли — закрываем их перед созданием нового
+        for (const x of pending) {
+            tx.update(x.ref, {
+                status: "expired",
+                updatedAt: FieldValue.serverTimestamp(),
+                expiredBy: reason, // можно убрать, если не хочешь поле
+            });
+        }
+
+        // читаем онлайн курьеров
+        const couriersSnap = await tx.get(
+            db.collection("courierPublic").where("isOnline", "==", true).limit(COURIERS_LIMIT)
+        );
+
+        const candidates: CourierPublic[] = couriersSnap.docs
+            .map((d) => {
+                const data: any = d.data();
+                return {
+                    id: d.id,
+                    isOnline: !!data.isOnline,
+                    lat: data.lat,
+                    lng: data.lng,
+                    lastSeenAt: data.lastSeenAt,
+                    activeOrdersCount: Number(data.activeOrdersCount ?? 0),
+                    pendingOffersCount: Number(data.pendingOffersCount ?? 0),
+                };
+            })
+            .filter((c) => {
+                if (!c.isOnline) return false;
+                if (typeof c.lat !== "number" || typeof c.lng !== "number") return false;
+                if (!isFresh(c.lastSeenAt)) return false;
+
+                // soft-limits (если поля считаются)
+                if ((c.activeOrdersCount ?? 0) >= MAX_ACTIVE_ORDERS) return false;
+                if ((c.pendingOffersCount ?? 0) >= MAX_PENDING_OFFERS) return false;
+
+                return true;
+            });
+
+        const courierId = pickCourierId(o, candidates);
+        if (!courierId) {
+            // нет курьеров — оставляем order в new и чистим offer-lock поля
+            tx.update(orderRef, {
+                status: "new",
+                currentOfferId: null,
+                currentOfferCourierId: null,
+                offerExpiresAtMs: null,
+                updatedAt: FieldValue.serverTimestamp(),
+            });
+            return;
+        }
+
+        const offerRef = db.collection("offers").doc();
+        const expiresAtMs = nowMs + OFFER_TIMEOUT_MS;
+        const cleanupAt = Timestamp.fromMillis(nowMs + OFFER_RETENTION_MS);
+
+        // создаём offer
+        tx.set(offerRef, {
+            restaurantId: o.restaurantId ?? null,
+            courierId,
+            orderId,
+
+            shortCode: o.shortCode ?? null,
+            publicCode: o.publicCode ?? null,
+            codeDateKey: o.codeDateKey ?? null,
+
+            pickupLat: o.pickupLat ?? null,
+            pickupLng: o.pickupLng ?? null,
+            pickupGeohash: o.pickupGeohash ?? null,
+            pickupAddressText: o.pickupAddressText ?? null,
+
+            customerName: o.customerName ?? null,
+            customerPhone: o.customerPhone ?? null,
+            customerAddress: o.customerAddress ?? null,
+
+            dropoffLat: o.dropoffLat ?? null,
+            dropoffLng: o.dropoffLng ?? null,
+            dropoffGeohash: o.dropoffGeohash ?? null,
+            dropoffAddressText: o.dropoffAddressText ?? null,
+
+            paymentType: o.paymentType ?? null,
+            orderSubtotal: o.orderSubtotal ?? null,
+            deliveryFee: o.deliveryFee ?? null,
+            orderTotal: o.orderTotal ?? null,
+
+            courierPaysAtPickup: o.courierPaysAtPickup ?? null,
+            courierCollectsFromCustomer: o.courierCollectsFromCustomer ?? null,
+            courierGetsFromRestaurantAtPickup: o.courierGetsFromRestaurantAtPickup ?? null,
+
+            status: "pending",
+            expiresAtMs,
+
+            // ✅ TTL поле
+            [TTL_FIELD]: cleanupAt,
+
+            createdAt: FieldValue.serverTimestamp(),
+            updatedAt: FieldValue.serverTimestamp(),
+        });
+
+        // lock на order (чтобы не плодить дублей)
+        tx.update(orderRef, {
+            status: "offered",
+            lastOfferedCourierId: courierId,
+            lastOfferedAt: FieldValue.serverTimestamp(),
+
+            currentOfferId: offerRef.id,
+            currentOfferCourierId: courierId,
+            offerExpiresAtMs: expiresAtMs,
+
+            updatedAt: FieldValue.serverTimestamp(),
+        });
+
+        logger.info("dispatchOrder: offer created", { orderId, offerId: offerRef.id, courierId, reason });
+    });
+}
+
+// ----------------------------
+// TRIGGERS
+// ----------------------------
+
+// 1) Новый заказ → сразу пробуем оффер
+export const dispatchOnOrderCreate = onDocumentCreated("orders/{orderId}", async (event) => {
+    const orderId = event.params.orderId;
+    const data = event.data?.data() as any;
+    if (!data) return;
+
+    // только если реально новый и не назначен
+    if (!isOpenOrderStatus(data.status ?? "new")) return;
+    if (data.assignedCourierId) return;
+
+    await dispatchOrder(orderId, "order_create");
+});
+
+// 2) Courier declined → сразу re-offer
+export const reofferOnDeclined = onDocumentUpdated("offers/{offerId}", async (event) => {
+    const offerId = event.params.offerId;
+    const before = event.data?.before.data() as any;
+    const after = event.data?.after.data() as any;
+    if (!before || !after) return;
+
+    const beforeStatus = String(before.status ?? "");
+    const afterStatus = String(after.status ?? "");
+
+    // интересует только переход pending -> declined
+    if (!(beforeStatus === "pending" && afterStatus === "declined")) return;
+
+    const orderId = String(after.orderId ?? "");
+    if (!orderId) return;
+
+    const orderRef = db.collection("orders").doc(orderId);
+
+    // чистим lock, если это был текущий оффер
+    let shouldDispatch = false;
+    await db.runTransaction(async (tx) => {
+        const os = await tx.get(orderRef);
+        if (!os.exists) return;
+        const o: any = os.data();
+
+        if (o.assignedCourierId) return;
+        if (!isOpenOrderStatus(o.status)) return;
+        if (o.currentOfferId !== offerId) return;
+
+        tx.update(orderRef, {
+
+            status: "new",
+            currentOfferId: null,
+            currentOfferCourierId: null,
+            offerExpiresAtMs: null,
+            updatedAt: FieldValue.serverTimestamp(),
+        });
+        shouldDispatch = true;
+    });
+    if (shouldDispatch) {
+        await dispatchOrder(orderId, "offer_declined");
+    }
+});
+
+// 3) Если заказ отменили/взяли → отменяем активный pending offer
+export const cancelOfferOnOrderClose = onDocumentUpdated("orders/{orderId}", async (event) => {
+    const before = event.data?.before.data() as any;
+    const after = event.data?.after.data() as any;
+    if (!before || !after) return;
+
+    const orderId = event.params.orderId;
+
+    const wasAssigned = !!before.assignedCourierId;
+    const isAssigned = !!after.assignedCourierId;
+
+    const beforeStatus = String(before.status ?? "");
+    const afterStatus = String(after.status ?? "");
+
+    const becameClosed =
+        (beforeStatus !== "cancelled" && afterStatus === "cancelled") ||
+        (beforeStatus !== "delivered" && afterStatus === "delivered") ||
+        (!wasAssigned && isAssigned);
+
+    if (!becameClosed) return;
+
+    const currentOfferId = typeof after.currentOfferId === "string" ? after.currentOfferId : null;
+    if (!currentOfferId) return;
+
+    const offerRef = db.collection("offers").doc(currentOfferId);
+
+    // отменяем оффер (если он еще pending)
+    try {
+        const offerSnap = await offerRef.get();
+        if (offerSnap.exists) {
+            const st = String((offerSnap.data() as any)?.status ?? "");
+            if (st === "pending") {
+                await offerRef.update({
+                    status: "cancelled",
+                    updatedAt: FieldValue.serverTimestamp(),
+                });
+            }
+        }
+    } catch {}
+
+    // чистим lock на order, чтобы не висело
+    try {
+        await db.collection("orders").doc(orderId).update({
+            currentOfferId: null,
+            currentOfferCourierId: null,
+            offerExpiresAtMs: null,
+            updatedAt: FieldValue.serverTimestamp(),
+        });
+    } catch {}
+});
+
+// 4) Scheduler: раз в минуту
+//    - помечаем просроченные offers как expired
+//    - и пытаемся раздать открытые заказы без активного оффера
+export const dispatchTick = onSchedule(
+    { schedule: "every 1 minutes", timeZone: "Asia/Jerusalem" },
+    async () => {
+        const nowMs = Date.now();
+
+// 4.1) expire pending offers (без composite index)
+        try {
+            const expiredSnap = await db
+                .collection("offers")
+                .where("expiresAtMs", "<=", nowMs)
+                .orderBy("expiresAtMs", "asc")
+                .limit(TICK_LIMIT)
+                .get();
+
+            const toReoffer = new Set<string>();
+
+            for (const docSnap of expiredSnap.docs) {
+                const offerId = docSnap.id;
+                const offer: any = docSnap.data();
+
+                // важно: мы сами фильтруем pending
+                if (String(offer.status ?? "") !== "pending") continue;
+
+                const orderId = String(offer.orderId ?? "");
+                if (!orderId) continue;
+
+                const offerRef = db.collection("offers").doc(offerId);
+                const orderRef = db.collection("orders").doc(orderId);
+
+                await db.runTransaction(async (tx) => {
+                    const off = await tx.get(offerRef);
+                    if (!off.exists) return;
+
+                    const offData: any = off.data();
+                    if (String(offData.status ?? "") !== "pending") return;
+
+                    const exp = Number(offData.expiresAtMs ?? 0);
+                    if (exp > nowMs) return; // safety
+
+                    tx.update(offerRef, {
+                        status: "expired",
+                        updatedAt: FieldValue.serverTimestamp(),
+                    });
+
+                    const os = await tx.get(orderRef);
+                    if (!os.exists) return;
+
+                    const o: any = os.data();
+
+                    // если этот offer был "текущим" у заказа — чистим lock
+                    if (
+                        o.currentOfferId === offerId &&
+                        !o.assignedCourierId &&
+                        isOpenOrderStatus(String(o.status ?? ""))
+                    ) {
+                        tx.update(orderRef, {
+                            status: "new",
+                            currentOfferId: null,
+                            currentOfferCourierId: null,
+                            offerExpiresAtMs: null,
+                            updatedAt: FieldValue.serverTimestamp(),
+                        });
+                    }
+                });
+
+                toReoffer.add(orderId);
+            }
+
+            // после expiring — пробуем перекинуть заново
+            for (const orderId of toReoffer) {
+                await dispatchOrder(orderId, "offer_timeout_tick");
+            }
+        } catch (e: any) {
+            logger.warn("dispatchTick: expire offers failed", {
+                error: e?.message ?? String(e),
+            });
+
+            // ✅ КРИТИЧНО: если expire упал — НЕ создаём новые offers
+            // иначе будут вечные дубли pending
+            return;
+        }
+
+        // 4.2) try dispatch open orders without active offer
+        // (двумя запросами, чтобы не упираться в лишние индексы)
+        const openOrderIds: string[] = [];
+
+        try {
+            const q1 = await db
+                .collection("orders")
+                .where("assignedCourierId", "==", null)
+                .where("status", "==", "new")
+                .limit(TICK_LIMIT)
+                .get();
+
+            for (const d of q1.docs) openOrderIds.push(d.id);
+
+            const q2 = await db
+                .collection("orders")
+                .where("assignedCourierId", "==", null)
+                .where("status", "==", "offered")
+                .limit(TICK_LIMIT)
+                .get();
+
+            for (const d of q2.docs) openOrderIds.push(d.id);
+        } catch (e: any) {
+            logger.warn("dispatchTick: open orders query failed", { error: e?.message ?? String(e) });
+        }
+
+        // дедуп по id
+        const uniq = Array.from(new Set(openOrderIds)).slice(0, TICK_LIMIT);
+
+        for (const orderId of uniq) {
+            await dispatchOrder(orderId, "open_orders_tick");
+        }
+    }
+);

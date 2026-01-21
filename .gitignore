@@ -10,3 +10,15 @@ node_modules/
 .env
 .env.*
 !**/.env.example
+
+# Firebase local stuff
+.firebase/
+
+# Debug logs
+firestore-debug.log
+pubsub-debug.log
+*.log
+
+# Optional build outputs (если это генерится сборкой)
+functions/lib/
+web/dist/
