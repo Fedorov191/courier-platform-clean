@@ -2,19 +2,71 @@ rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
 
+    // ----------------------------
+    // HELPERS
+    // ----------------------------
     function signedIn() { return request.auth != null; }
 
     function isRestaurant() {
-      return signedIn() && exists(/databases/$(database)/documents/restaurants/$(request.auth.uid));
+      return signedIn()
+        && exists(/databases/$(database)/documents/restaurants/$(request.auth.uid));
     }
 
     function isCourier() {
-      return signedIn() && exists(/databases/$(database)/documents/couriers/$(request.auth.uid));
+      return signedIn()
+        && exists(/databases/$(database)/documents/couriers/$(request.auth.uid));
     }
 
     function offerStatusOnlyChange() {
       return request.resource.data.diff(resource.data).affectedKeys()
         .hasOnly(["status", "updatedAt"]);
+    }
+
+    function onlyChanges(keys) {
+      return request.resource.data.diff(resource.data).affectedKeys().hasOnly(keys);
+    }
+
+    // Курьер читает заказ только если:
+    // - заказ назначен ему
+    // - ИЛИ заказ предложен ему (currentOfferCourierId)
+    function courierCanReadOrder() {
+      return isCourier() && (
+        resource.data.assignedCourierId == request.auth.uid
+        || resource.data.currentOfferCourierId == request.auth.uid
+      );
+    }
+
+    function courierCanTake() {
+      return isCourier()
+        && resource.data.assignedCourierId == null
+        && (resource.data.status == "new" || resource.data.status == "offered")
+        && resource.data.currentOfferCourierId == request.auth.uid
+        && request.resource.data.assignedCourierId == request.auth.uid
+        && request.resource.data.status == "taken"
+        && onlyChanges(["assignedCourierId", "status", "acceptedAt", "updatedAt"]);
+    }
+
+    function courierCanPickUp() {
+      return isCourier()
+        && resource.data.assignedCourierId == request.auth.uid
+        && resource.data.status == "taken"
+        && request.resource.data.status == "picked_up"
+        && onlyChanges(["status", "pickedUpAt", "updatedAt"]);
+    }
+
+    function courierCanDeliver() {
+      return isCourier()
+        && resource.data.assignedCourierId == request.auth.uid
+        && resource.data.status == "picked_up"
+        && request.resource.data.status == "delivered"
+        && onlyChanges([
+          "status",
+          "deliveredAt",
+          "deliveredDateKey",
+          "deliveredMonthKey",
+          "deliveredYearKey",
+          "updatedAt"
+        ]);
     }
 
     // ----------------------------
@@ -50,9 +102,10 @@ service cloud.firestore {
     match /restaurants/{restaurantId} {
       allow read, write: if signedIn() && request.auth.uid == restaurantId;
     }
-match /restaurants/{restaurantId}/dayCounters/{dateKey} {
-  allow read, write: if signedIn() && request.auth.uid == restaurantId;
-}
+
+    match /restaurants/{restaurantId}/dayCounters/{dateKey} {
+      allow read, write: if signedIn() && request.auth.uid == restaurantId;
+    }
 
     // ----------------------------
     // Couriers: только свой документ
@@ -70,7 +123,7 @@ match /restaurants/{restaurantId}/dayCounters/{dateKey} {
     }
 
     // ----------------------------
-    // Chats (ВАЖНО: на верхнем уровне!)
+    // Chats (верхний уровень)
     // ----------------------------
     match /chats/{chatId} {
       allow read: if isChatParticipant(chatId);
@@ -98,7 +151,6 @@ match /restaurants/{restaurantId}/dayCounters/{dateKey} {
     // ----------------------------
     match /orders/{orderId} {
 
-      // CREATE: только ресторан создаёт заказ для себя
       allow create: if signedIn()
         && isRestaurant()
         && request.resource.data.restaurantId == request.auth.uid
@@ -107,33 +159,16 @@ match /restaurants/{restaurantId}/dayCounters/{dateKey} {
           || request.resource.data.assignedCourierId == null
         );
 
-      // READ
       allow read: if signedIn() && (
         (isRestaurant() && resource.data.restaurantId == request.auth.uid)
-        ||
-        (isCourier() && (
-          resource.data.assignedCourierId == request.auth.uid
-          || resource.data.assignedCourierId == null
-        ))
+        || courierCanReadOrder()
       );
 
-      // UPDATE
       allow update: if signedIn() && (
         (isRestaurant() && resource.data.restaurantId == request.auth.uid)
-        ||
-        (isCourier() && (
-          (
-            resource.data.assignedCourierId == null
-            && (resource.data.status == "new" || resource.data.status == "offered")
-            && request.resource.data.assignedCourierId == request.auth.uid
-            && request.resource.data.status == "taken"
-          )
-          ||
-          (
-            resource.data.assignedCourierId == request.auth.uid
-            && (resource.data.status == "taken" || resource.data.status == "picked_up")
-          )
-        ))
+        || courierCanTake()
+        || courierCanPickUp()
+        || courierCanDeliver()
       );
 
       allow delete: if false;
@@ -143,31 +178,21 @@ match /restaurants/{restaurantId}/dayCounters/{dateKey} {
     // Offers
     // ----------------------------
     match /offers/{offerId} {
-      allow create: if signedIn()
-        && isRestaurant()
-        && request.resource.data.restaurantId == request.auth.uid;
+
+      // offers создаёт только Cloud Functions (Admin SDK)
+      allow create: if false;
 
       allow read: if signedIn() && (
         (isCourier() && resource.data.courierId == request.auth.uid)
-        ||
-        (isRestaurant() && resource.data.restaurantId == request.auth.uid)
+        || (isRestaurant() && resource.data.restaurantId == request.auth.uid)
       );
 
-      allow update: if signedIn() && (
-        (
-          isCourier()
-          && resource.data.courierId == request.auth.uid
-          && offerStatusOnlyChange()
-          && request.resource.data.status in ["accepted", "declined"]
-        )
-        ||
-        (
-          isRestaurant()
-          && resource.data.restaurantId == request.auth.uid
-          && offerStatusOnlyChange()
-          && request.resource.data.status in ["cancelled", "expired"]
-        )
-      );
+      allow update: if signedIn()
+        && isCourier()
+        && resource.data.courierId == request.auth.uid
+        && resource.data.status == "pending"
+        && offerStatusOnlyChange()
+        && request.resource.data.status in ["accepted", "declined"];
 
       allow delete: if false;
     }

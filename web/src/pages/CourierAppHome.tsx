@@ -17,6 +17,7 @@ import { signOut } from "firebase/auth";
 import { useNavigate } from "react-router-dom";
 import { geohashForLocation } from "geofire-common";
 
+// @ts-ignore
 type Role = "courier" | "restaurant";
 
 type Offer = {
@@ -58,6 +59,7 @@ function shortId(id: string) {
     return (id || "").slice(0, 6).toUpperCase();
 }
 
+// ✅ Возвращаем сразу 3 ключа отчётов (строки)
 function israelDateKey(d = new Date()) {
     const parts = new Intl.DateTimeFormat("en-CA", {
         timeZone: "Asia/Jerusalem",
@@ -69,7 +71,11 @@ function israelDateKey(d = new Date()) {
     const y = parts.find((p) => p.type === "year")?.value ?? "0000";
     const m = parts.find((p) => p.type === "month")?.value ?? "00";
     const day = parts.find((p) => p.type === "day")?.value ?? "00";
-    return `${y}-${m}-${day}`; // YYYY-MM-DD
+    return {
+        deliveredDateKey: `${y}-${m}-${day}`, // YYYY-MM-DD
+        deliveredMonthKey: `${y}-${m}`,       // YYYY-MM
+        deliveredYearKey: `${y}`,             // YYYY
+    };
 }
 
 function money(n?: number) {
@@ -200,7 +206,6 @@ export default function CourierAppHome() {
         const ctx = audioCtxRef.current;
         if (!ctx) return;
 
-        // если вдруг подвис — пробуем возобновить
         if (ctx.state === "suspended") {
             ctx.resume().catch(() => {});
             return;
@@ -545,18 +550,24 @@ export default function CourierAppHome() {
         }
     }
 
+    // ✅ FIX: распыляем ключи, а не кладём объект в deliveredDateKey
     async function markDelivered(orderId: string) {
         setBusyOrderAction("deliver");
+        setErr(null);
+
         try {
+            const keys = israelDateKey();
+
             await updateDoc(doc(db, "orders", orderId), {
                 status: "delivered",
                 deliveredAt: serverTimestamp(),
 
-                // ✅ A4.3: ключ даты доставки (Israel TZ) для отчётов
-                deliveredDateKey: israelDateKey(),
+                ...keys, // ✅ deliveredDateKey/monthKey/yearKey = строки
 
                 updatedAt: serverTimestamp(),
             });
+        } catch (e: any) {
+            setErr(e?.message ?? "Failed to mark delivered");
         } finally {
             setBusyOrderAction(null);
         }
