@@ -97,6 +97,108 @@ function pickCourierId(order: any, candidates: CourierPublic[]): string | null {
     if (idx === -1) return sorted[0];
     return sorted[(idx + 1) % sorted.length];
 }
+import { onCall, HttpsError } from "firebase-functions/v2/https";
+import { defineSecret } from "firebase-functions/params";
+
+
+const GOOGLE_MAPS_API_KEY = defineSecret("GOOGLE_MAPS_API_KEY");
+
+type LatLng = { lat: number; lng: number };
+
+function calcDeliveryFee(distanceMeters: number) {
+    const km = distanceMeters / 1000;
+    const base = 17;
+    const perKm = 3.5;
+
+    const extraKm = Math.max(0, km - 3);
+    const raw = base + extraKm * perKm;
+
+    // чтобы не словить 17.699999999 из-за float
+    const fee = Math.round((raw + Number.EPSILON) * 100) / 100;
+
+    return { km, fee };
+}
+
+export const getRouteQuote = onCall(
+    {
+        region: "europe-west1", // можно поменять, но важно чтобы совпадало с web getFunctions(app, region)
+        secrets: [GOOGLE_MAPS_API_KEY],
+    },
+    async (req) => {
+        if (!req.auth) throw new HttpsError("unauthenticated", "Login required");
+
+        const { origin, destination } = (req.data ?? {}) as {
+            origin?: LatLng;
+            destination?: LatLng;
+        };
+
+        const ok =
+            origin &&
+            destination &&
+            typeof origin.lat === "number" &&
+            typeof origin.lng === "number" &&
+            typeof destination.lat === "number" &&
+            typeof destination.lng === "number";
+
+        if (!ok) {
+            throw new HttpsError("invalid-argument", "origin/destination {lat,lng} required");
+        }
+
+        const key = GOOGLE_MAPS_API_KEY.value();
+        const url = "https://routes.googleapis.com/directions/v2:computeRoutes";
+
+        const body = {
+            origin: { location: { latLng: { latitude: origin.lat, longitude: origin.lng } } },
+            destination: { location: { latLng: { latitude: destination.lat, longitude: destination.lng } } },
+            travelMode: "DRIVE",
+            routingPreference: "TRAFFIC_AWARE",
+            computeAlternativeRoutes: false,
+            languageCode: "en-US",
+            units: "METRIC",
+        };
+
+        const resp = await fetch(url, {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json",
+                "X-Goog-Api-Key": key,
+                "X-Goog-FieldMask": "routes.distanceMeters,routes.duration",
+            },
+            body: JSON.stringify(body),
+        });
+
+        if (!resp.ok) {
+            const text = await resp.text().catch(() => "");
+            logger.warn("Routes API error", { status: resp.status, text });
+            throw new HttpsError("internal", "Failed to compute route");
+        }
+
+        const json: any = await resp.json();
+        const r0 = json?.routes?.[0];
+
+        const distanceMeters = Number(r0?.distanceMeters ?? NaN);
+
+        // duration приходит строкой вида "123s"
+        const durationStr = String(r0?.duration ?? "0s");
+        const m = durationStr.match(/^(\d+(?:\.\d+)?)s$/);
+        const durationSeconds = m ? Number(m[1]) : 0;
+
+        if (!Number.isFinite(distanceMeters) || distanceMeters <= 0) {
+            throw new HttpsError("internal", "Route distance missing");
+        }
+
+        const { km, fee } = calcDeliveryFee(distanceMeters);
+
+        return {
+            distanceMeters,
+            distanceKm: km,
+            durationSeconds,
+            deliveryFee: fee,
+            currency: "ILS",
+            pricingVersion: "v1",
+        };
+    }
+);
 
 /**
  * Главная функция: создать pending offer для order (если можно)
@@ -108,6 +210,9 @@ async function dispatchOrder(orderId: string, reason: string) {
     const orderRef = db.collection("orders").doc(orderId);
 
     await db.runTransaction(async (tx) => {
+        // --------------------
+        // READS (ONLY) FIRST
+        // --------------------
         const orderSnap = await tx.get(orderRef);
         if (!orderSnap.exists) return;
 
@@ -118,62 +223,35 @@ async function dispatchOrder(orderId: string, reason: string) {
         if (o.assignedCourierId) return;
         if (o.status === "cancelled" || o.status === "delivered") return;
 
-        // если уже есть активный оффер — не создаём новый
-        const exp = typeof o.offerExpiresAtMs === "number" ? o.offerExpiresAtMs : 0;
-        const hasActiveOffer =
-            exp > nowMs && typeof o.currentOfferId === "string" && o.currentOfferId;
-
-        if (hasActiveOffer) return;
-        // ✅ ВАЖНО: если lock уже протух, но старый offer ещё pending — закрываем его,
-        // иначе будут дубли pending офферов на один orderId
-        const prevOfferId =
-            typeof o.currentOfferId === "string" && o.currentOfferId ? o.currentOfferId : null;
-
-        if (prevOfferId) {
-            const prevOfferRef = db.collection("offers").doc(prevOfferId);
-            const prevOfferSnap = await tx.get(prevOfferRef);
-
-            if (prevOfferSnap.exists) {
-                const prev: any = prevOfferSnap.data();
-                const prevStatus = String(prev?.status ?? "");
-
-                // если вдруг order.offerExpiresAtMs сломан, но сам offer ещё жив — считаем его активным и выходим
-                const prevExp = Number(prev?.expiresAtMs ?? 0);
-                if (prevStatus === "pending" && prevExp > nowMs) {
-                    // подлечим order, чтобы не плодить новые
-                    tx.update(orderRef, {
-                        offerExpiresAtMs: prevExp,
-                        currentOfferCourierId: prev?.courierId ?? o.currentOfferCourierId ?? null,
-                        updatedAt: FieldValue.serverTimestamp(),
-                    });
-                    return;
-                }
-
-                // если pending и уже должен быть закрыт — закрываем
-                if (prevStatus === "pending") {
-                    tx.update(prevOfferRef, {
-                        status: "expired",
-                        updatedAt: FieldValue.serverTimestamp(),
-                        expiredBy: reason, // просто для дебага (можно убрать)
-                    });
-                }
-            }
-        }
-// ✅ HARD DEDUP: найдём любые pending offers по этому orderId
+        // ✅ HARD DEDUP: читаем офферы по orderId (ДО любых записей!)
         const offersSnap = await tx.get(
-            db.collection("offers")
-                .where("orderId", "==", orderId)
-                .limit(20)
+            db.collection("offers").where("orderId", "==", orderId).limit(50)
         );
 
-        const pending = offersSnap.docs
-            .map((d) => ({ id: d.id, ref: d.ref, data: d.data() as any }))
-            .filter((x) => String(x.data?.status ?? "") === "pending");
+        const offers = offersSnap.docs.map((d) => ({
+            id: d.id,
+            ref: d.ref,
+            data: d.data() as any,
+        }));
 
-// 1) Если есть pending, который ещё НЕ истёк — считаем его активным и выходим
+        const pending = offers.filter((x) => String(x.data?.status ?? "") === "pending");
+
         const activePending = pending.find((x) => Number(x.data?.expiresAtMs ?? 0) > nowMs);
 
+        // Если есть активный pending — “лечим” order и закрываем дубли
         if (activePending) {
+            // --------------------
+            // WRITES
+            // --------------------
+            for (const x of pending) {
+                if (x.id === activePending.id) continue;
+                tx.update(x.ref, {
+                    status: "expired",
+                    updatedAt: FieldValue.serverTimestamp(),
+                    expiredBy: reason,
+                });
+            }
+
             tx.update(orderRef, {
                 status: "offered",
                 currentOfferId: activePending.id,
@@ -181,19 +259,12 @@ async function dispatchOrder(orderId: string, reason: string) {
                 offerExpiresAtMs: Number(activePending.data?.expiresAtMs ?? null),
                 updatedAt: FieldValue.serverTimestamp(),
             });
+
             return;
         }
 
-// 2) Если pending есть, но уже протухли — закрываем их перед созданием нового
-        for (const x of pending) {
-            tx.update(x.ref, {
-                status: "expired",
-                updatedAt: FieldValue.serverTimestamp(),
-                expiredBy: reason, // можно убрать, если не хочешь поле
-            });
-        }
-
-        // читаем онлайн курьеров
+        // ✅ Нет активного pending — значит можно создавать новый.
+        // Но сначала читаем курьеров (всё ещё READS!)
         const couriersSnap = await tx.get(
             db.collection("courierPublic").where("isOnline", "==", true).limit(COURIERS_LIMIT)
         );
@@ -215,17 +286,27 @@ async function dispatchOrder(orderId: string, reason: string) {
                 if (!c.isOnline) return false;
                 if (typeof c.lat !== "number" || typeof c.lng !== "number") return false;
                 if (!isFresh(c.lastSeenAt)) return false;
-
-                // soft-limits (если поля считаются)
                 if ((c.activeOrdersCount ?? 0) >= MAX_ACTIVE_ORDERS) return false;
                 if ((c.pendingOffersCount ?? 0) >= MAX_PENDING_OFFERS) return false;
-
                 return true;
             });
 
         const courierId = pickCourierId(o, candidates);
+
+        // --------------------
+        // WRITES
+        // --------------------
+
+        // закрываем ВСЕ pending (они уже не активны)
+        for (const x of pending) {
+            tx.update(x.ref, {
+                status: "expired",
+                updatedAt: FieldValue.serverTimestamp(),
+                expiredBy: reason,
+            });
+        }
+
         if (!courierId) {
-            // нет курьеров — оставляем order в new и чистим offer-lock поля
             tx.update(orderRef, {
                 status: "new",
                 currentOfferId: null,
@@ -240,7 +321,6 @@ async function dispatchOrder(orderId: string, reason: string) {
         const expiresAtMs = nowMs + OFFER_TIMEOUT_MS;
         const cleanupAt = Timestamp.fromMillis(nowMs + OFFER_RETENTION_MS);
 
-        // создаём offer
         tx.set(offerRef, {
             restaurantId: o.restaurantId ?? null,
             courierId,
@@ -276,14 +356,19 @@ async function dispatchOrder(orderId: string, reason: string) {
             status: "pending",
             expiresAtMs,
 
-            // ✅ TTL поле
             [TTL_FIELD]: cleanupAt,
 
             createdAt: FieldValue.serverTimestamp(),
             updatedAt: FieldValue.serverTimestamp(),
+            prepTimeMin: o.prepTimeMin ?? null,
+            readyAtMs: typeof o.readyAtMs === "number" ? o.readyAtMs : null,
+
+            routeDistanceMeters: typeof o.routeDistanceMeters === "number" ? o.routeDistanceMeters : null,
+            routeDurationSeconds: typeof o.routeDurationSeconds === "number" ? o.routeDurationSeconds : null,
+            pricingVersion: o.pricingVersion ?? null,
+
         });
 
-        // lock на order (чтобы не плодить дублей)
         tx.update(orderRef, {
             status: "offered",
             lastOfferedCourierId: courierId,
@@ -296,9 +381,15 @@ async function dispatchOrder(orderId: string, reason: string) {
             updatedAt: FieldValue.serverTimestamp(),
         });
 
-        logger.info("dispatchOrder: offer created", { orderId, offerId: offerRef.id, courierId, reason });
+        logger.info("dispatchOrder: offer created", {
+            orderId,
+            offerId: offerRef.id,
+            courierId,
+            reason,
+        });
     });
 }
+
 
 // ----------------------------
 // TRIGGERS
@@ -424,10 +515,12 @@ export const dispatchTick = onSchedule(
         try {
             const expiredSnap = await db
                 .collection("offers")
+                .where("status", "==", "pending")
                 .where("expiresAtMs", "<=", nowMs)
                 .orderBy("expiresAtMs", "asc")
                 .limit(TICK_LIMIT)
                 .get();
+
 
             const toReoffer = new Set<string>();
 

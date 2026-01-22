@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import { auth, db } from "../lib/firebase";
 import {
     addDoc,
     collection,
@@ -9,89 +10,77 @@ import {
     query,
     serverTimestamp,
     setDoc,
-    Timestamp,
+    updateDoc,
 } from "firebase/firestore";
-import { auth, db } from "../lib/firebase";
 
 type Role = "courier" | "restaurant";
 
-type ChatMessage = {
+type MessageDoc = {
     id: string;
     text: string;
     senderId: string;
     senderRole: Role;
-    createdAt?: Timestamp;
+    createdAt?: any; // Firestore Timestamp
 };
 
-function formatTime(ts?: Timestamp) {
-    if (!ts) return "";
-    try {
-        return ts.toDate().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
-    } catch {
-        return "";
-    }
-}
-
-export function OrderChat(props: {
+type Props = {
     chatId: string;
     orderId: string;
     restaurantId: string;
     courierId: string;
     myRole: Role;
     disabled?: boolean;
-}) {
-    const { chatId, orderId, restaurantId, courierId, myRole, disabled } = props;
+};
 
-    const me = auth.currentUser;
+export function OrderChat({
+                              chatId,
+                              orderId,
+                              restaurantId,
+                              courierId,
+                              myRole,
+                              disabled,
+                          }: Props) {
+    const user = auth.currentUser;
 
-    const [chatReady, setChatReady] = useState(false);
+    const chatRef = useMemo(() => doc(db, "chats", chatId), [chatId]);
+    const messagesCol = useMemo(() => collection(db, "chats", chatId, "messages"), [chatId]);
 
-    const [messages, setMessages] = useState<ChatMessage[]>([]);
+    const [messages, setMessages] = useState<MessageDoc[]>([]);
     const [text, setText] = useState("");
     const [sending, setSending] = useState(false);
     const [err, setErr] = useState<string | null>(null);
 
-    const bottomRef = useRef<HTMLDivElement | null>(null);
+    // чтобы не спамить lastReadAt на каждый снапшот
+    const lastMarkedReadMsgIdRef = useRef<string | null>(null);
 
-    const canUse = useMemo(() => {
-        if (!me) return false;
-        if (disabled) return false;
-        if (!chatReady) return false;
-        return true;
-    }, [me, disabled, chatReady]);
+    const readField = myRole === "courier" ? "lastReadAtCourier" : "lastReadAtRestaurant";
 
-    // 1) Ensure chat doc exists
+    // 1) ensure chat doc exists (и содержит orderId/restaurantId/courierId)
     useEffect(() => {
         let cancelled = false;
 
         async function ensureChat() {
-            if (!me) return;
-            if (!chatId) return;
-
-            // каждый раз при смене chatId заново “готовим” чат
-            setChatReady(false);
-            setErr(null);
+            if (!user) return;
 
             try {
                 await setDoc(
-                    doc(db, "chats", chatId),
+                    chatRef,
                     {
-                        chatId,
                         orderId,
                         restaurantId,
                         courierId,
-                        createdAt: serverTimestamp(),
                         updatedAt: serverTimestamp(),
+
+                        // мета (может быть null у старых чатов — ок)
+                        lastMessageAt: null,
+                        lastMessageSenderId: null,
+                        lastReadAtCourier: null,
+                        lastReadAtRestaurant: null,
                     },
                     { merge: true }
                 );
-
-                if (!cancelled) setChatReady(true);
             } catch (e: any) {
-                if (!cancelled) {
-                    setErr(e?.message ?? "Failed to init chat");
-                    setChatReady(false);
-                }
+                if (!cancelled) setErr(e?.message ?? "Failed to init chat");
             }
         }
 
@@ -99,24 +88,18 @@ export function OrderChat(props: {
         return () => {
             cancelled = true;
         };
-    }, [chatId, orderId, restaurantId, courierId, me]);
+    }, [user, chatRef, orderId, restaurantId, courierId]);
 
-    // 2) Subscribe to messages (ТОЛЬКО когда chatReady = true)
+    // 2) subscribe to messages
     useEffect(() => {
-        if (!me) return;
-        if (!chatId) return;
-        if (!chatReady) return;
+        if (!user) return;
 
-        const q = query(
-            collection(db, "chats", chatId, "messages"),
-            orderBy("createdAt", "asc"),
-            limit(60)
-        );
+        const q = query(messagesCol, orderBy("createdAt", "asc"), limit(200));
 
         const unsub = onSnapshot(
             q,
             (snap) => {
-                const list: ChatMessage[] = snap.docs.map((d) => {
+                const list: MessageDoc[] = snap.docs.map((d) => {
                     const data: any = d.data();
                     return {
                         id: d.id,
@@ -126,27 +109,37 @@ export function OrderChat(props: {
                         createdAt: data.createdAt,
                     };
                 });
-
                 setMessages(list);
-
-                // scroll down
-                setTimeout(() => bottomRef.current?.scrollIntoView({ behavior: "smooth" }), 0);
             },
-            (e: any) => setErr(e?.message ?? "Failed to load chat")
+            (e: any) => setErr(e?.message ?? "Failed to load messages")
         );
 
         return () => unsub();
-    }, [chatId, me, chatReady]);
+    }, [user, messagesCol]);
+
+    // 3) mark as read when chat is open and last message is from the other side
+    useEffect(() => {
+        if (!user) return;
+        if (messages.length === 0) return;
+
+        const last = messages[messages.length - 1];
+        if (!last) return;
+
+        // если последнее сообщение моё — ничего не делаем
+        if (last.senderId === user.uid) return;
+
+        // анти-спам: если мы уже отмечали "прочитано" именно для этого msgId
+        if (lastMarkedReadMsgIdRef.current === last.id) return;
+        lastMarkedReadMsgIdRef.current = last.id;
+
+        updateDoc(chatRef, {
+            [readField]: serverTimestamp(),
+            updatedAt: serverTimestamp(),
+        }).catch(() => {});
+    }, [messages, user, chatRef, readField]);
 
     async function send() {
-        if (!me) return;
-        if (!chatId) return;
-
-        if (!chatReady) {
-            setErr("Chat is initializing… try again in a second.");
-            return;
-        }
-
+        if (!user) return;
         if (disabled) return;
 
         const t = text.trim();
@@ -156,99 +149,78 @@ export function OrderChat(props: {
         setSending(true);
 
         try {
-            await addDoc(collection(db, "chats", chatId, "messages"), {
+            // messages правила: строго эти 4 поля
+            await addDoc(messagesCol, {
                 text: t,
-                senderId: me.uid,
+                senderId: user.uid,
                 senderRole: myRole,
                 createdAt: serverTimestamp(),
             });
 
-            // meta update (удобно для будущего списка чатов)
-            await setDoc(
-                doc(db, "chats", chatId),
-                {
-                    lastMessageText: t,
-                    lastMessageAt: serverTimestamp(),
-                    updatedAt: serverTimestamp(),
-                },
-                { merge: true }
-            );
+            // мета чата (для unread + звука)
+            await updateDoc(chatRef, {
+                lastMessageAt: serverTimestamp(),
+                lastMessageSenderId: user.uid,
+                updatedAt: serverTimestamp(),
+
+                // отправитель точно прочитал своё сообщение
+                [readField]: serverTimestamp(),
+            });
 
             setText("");
         } catch (e: any) {
-            setErr(e?.message ?? "Failed to send");
+            setErr(e?.message ?? "Failed to send message");
         } finally {
             setSending(false);
         }
     }
 
-    if (!me) return null;
-
     return (
-        <div className="subcard" style={{ marginTop: 12 }}>
-            <div className="row row--between row--wrap">
-                <div style={{ fontWeight: 900 }}>Chat</div>
-
-                {!chatReady && (
-                    <span className="pill pill--muted" style={{ fontSize: 12 }}>
-            initializing…
-          </span>
-                )}
-
-                {!canUse && chatReady && (
-                    <span className="pill pill--muted" style={{ fontSize: 12 }}>
-            read-only
-          </span>
-                )}
+        <div className="subcard" style={{ marginTop: 10 }}>
+            <div className="row row--between row--wrap" style={{ alignItems: "baseline" }}>
+                <b>Chat</b>
+                <span className="muted" style={{ fontSize: 12 }}>
+          {myRole.toUpperCase()}
+        </span>
             </div>
 
-            <div style={{ height: 8 }} />
+            <div className="hr" />
+
+            {err && <div className="alert alert--danger">{err}</div>}
 
             <div
                 style={{
-                    border: "1px solid #333",
-                    borderRadius: 12,
-                    padding: 10,
-                    maxHeight: 180,
+                    maxHeight: 220,
                     overflow: "auto",
+                    display: "grid",
+                    gap: 8,
+                    padding: 6,
                 }}
             >
-                {messages.length === 0 ? (
-                    <div className="muted" style={{ fontSize: 13 }}>
-                        No messages yet
-                    </div>
-                ) : (
-                    <div style={{ display: "grid", gap: 8 }}>
-                        {messages.map((m) => {
-                            const mine = m.senderId === me.uid;
-                            const who = m.senderRole === "restaurant" ? "Restaurant" : "Courier";
+                {messages.length === 0 && <div className="muted">No messages yet.</div>}
 
-                            return (
-                                <div
-                                    key={m.id}
-                                    style={{ display: "flex", justifyContent: mine ? "flex-end" : "flex-start" }}
-                                >
-                                    <div
-                                        style={{
-                                            maxWidth: "85%",
-                                            border: "1px solid #333",
-                                            borderRadius: 12,
-                                            padding: "8px 10px",
-                                            fontSize: 13,
-                                            lineHeight: 1.25,
-                                        }}
-                                    >
-                                        <div style={{ fontSize: 11, opacity: 0.7, marginBottom: 4 }}>
-                                            {mine ? "You" : who} {m.createdAt ? `· ${formatTime(m.createdAt)}` : ""}
-                                        </div>
-                                        <div style={{ whiteSpace: "pre-wrap" }}>{m.text}</div>
-                                    </div>
-                                </div>
-                            );
-                        })}
-                        <div ref={bottomRef} />
-                    </div>
-                )}
+                {messages.map((m) => {
+                    const mine = user && m.senderId === user.uid;
+
+                    return (
+                        <div
+                            key={m.id}
+                            style={{
+                                justifySelf: mine ? "end" : "start",
+                                maxWidth: "85%",
+                                padding: "8px 10px",
+                                borderRadius: 10,
+                                border: "1px solid #333",
+                                background: mine ? "rgba(255,255,255,0.06)" : "rgba(0,0,0,0.15)",
+                            }}
+                        >
+                            <div style={{ fontSize: 12, opacity: 0.8, marginBottom: 4 }}>
+                                {mine ? "You" : m.senderRole}
+                            </div>
+                            <div style={{ whiteSpace: "pre-wrap" }}>{m.text}</div>
+                        </div>
+                    );
+                })}
             </div>
 
             <div style={{ height: 10 }} />
@@ -257,8 +229,8 @@ export function OrderChat(props: {
                 <input
                     value={text}
                     onChange={(e) => setText(e.target.value)}
-                    placeholder={canUse ? "Type a message…" : !chatReady ? "Chat initializing…" : "Chat disabled"}
-                    disabled={!canUse || sending}
+                    placeholder={disabled ? "Chat disabled" : "Type a message…"}
+                    disabled={!!disabled || sending}
                     style={{
                         flex: 1,
                         minWidth: 220,
@@ -268,23 +240,17 @@ export function OrderChat(props: {
                         outline: "none",
                     }}
                     onKeyDown={(e) => {
-                        if (e.key === "Enter" && !e.shiftKey) {
+                        if (e.key === "Enter") {
                             e.preventDefault();
                             send();
                         }
                     }}
                 />
 
-                <button className="btn btn--primary" onClick={send} disabled={!canUse || sending || text.trim().length === 0}>
+                <button className="btn btn--primary" onClick={send} disabled={!!disabled || sending}>
                     {sending ? "Sending…" : "Send"}
                 </button>
             </div>
-
-            {err && (
-                <div className="alert alert--danger" style={{ marginTop: 10 }}>
-                    {err}
-                </div>
-            )}
         </div>
     );
 }

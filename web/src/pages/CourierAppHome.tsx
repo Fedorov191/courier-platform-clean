@@ -53,6 +53,11 @@ type Offer = {
     shortCode?: string;
     publicCode?: string;
     codeDateKey?: string;
+
+    prepTimeMin?: number;
+    readyAtMs?: number;
+    routeDistanceMeters?: number;
+    routeDurationSeconds?: number;
 };
 
 function shortId(id: string) {
@@ -147,6 +152,17 @@ function labelForOrderStatus(status?: string) {
             return (status || "—").toUpperCase();
     }
 }
+function readyInText(readyAtMs?: number, nowMs?: number) {
+    if (typeof readyAtMs !== "number" || !Number.isFinite(readyAtMs)) return "—";
+
+    const diff = readyAtMs - (typeof nowMs === "number" ? nowMs : Date.now());
+    if (diff <= 0) return "READY";
+
+    const totalSec = Math.ceil(diff / 1000);
+    const mm = Math.floor(totalSec / 60);
+    const ss = totalSec % 60;
+    return `${mm}:${String(ss).padStart(2, "0")}`;
+}
 
 export default function CourierAppHome() {
     const nav = useNavigate();
@@ -181,6 +197,23 @@ export default function CourierAppHome() {
     const [busyOfferId, setBusyOfferId] = useState<string | null>(null);
     const [busyOrderAction, setBusyOrderAction] = useState<"pickup" | "deliver" | null>(null);
     const [chatOpenByOrderId, setChatOpenByOrderId] = useState<Record<string, boolean>>({});
+    // ✅ chat unread badges
+    const [unreadByOrderId, setUnreadByOrderId] = useState<Record<string, boolean>>({});
+    const chatLastMsgAtByChatIdRef = useRef<Record<string, number>>({});
+
+// чтобы в onSnapshot видеть актуально открытые чаты (без ресабскрайба)
+    const chatOpenRef = useRef(chatOpenByOrderId);
+    useEffect(() => {
+        chatOpenRef.current = chatOpenByOrderId;
+    }, [chatOpenByOrderId]);
+
+    // ✅ ticker for countdowns (ready timer)
+    const [nowMs, setNowMs] = useState(() => Date.now());
+
+    useEffect(() => {
+        const id = window.setInterval(() => setNowMs(Date.now()), 1000);
+        return () => window.clearInterval(id);
+    }, []);
 
     function toggleChat(orderId: string) {
         setChatOpenByOrderId((prev) => ({ ...prev, [orderId]: !prev[orderId] }));
@@ -224,6 +257,29 @@ export default function CourierAppHome() {
         const t0 = ctx.currentTime;
         osc.start(t0);
         osc.stop(t0 + 0.08);
+    }
+    function playChatBeep() {
+        const ctx = audioCtxRef.current;
+        if (!ctx) return;
+
+        if (ctx.state === "suspended") {
+            ctx.resume().catch(() => {});
+            return;
+        }
+
+        const osc = ctx.createOscillator();
+        const gain = ctx.createGain();
+
+        osc.type = "sine";
+        osc.frequency.value = 660; // другой тон, чтобы отличать от offers
+        gain.gain.value = 0.06;
+
+        osc.connect(gain);
+        gain.connect(ctx.destination);
+
+        const t0 = ctx.currentTime;
+        osc.start(t0);
+        osc.stop(t0 + 0.06);
     }
 
     useEffect(() => {
@@ -308,6 +364,12 @@ export default function CourierAppHome() {
                         courierPaysAtPickup: data.courierPaysAtPickup,
                         courierCollectsFromCustomer: data.courierCollectsFromCustomer,
                         courierGetsFromRestaurantAtPickup: data.courierGetsFromRestaurantAtPickup,
+
+                        prepTimeMin: data.prepTimeMin,
+                        readyAtMs: data.readyAtMs,
+                        routeDistanceMeters: data.routeDistanceMeters,
+                        routeDurationSeconds: data.routeDurationSeconds,
+
                     };
                 });
 
@@ -339,6 +401,55 @@ export default function CourierAppHome() {
     }, [user]);
 
     // subscribe to completed (delivered) orders
+    useEffect(() => {
+        if (!user) return;
+
+        const qChats = query(collection(db, "chats"), where("courierId", "==", user.uid));
+
+        const unsub = onSnapshot(
+            qChats,
+            (snap) => {
+                const nextUnread: Record<string, boolean> = {};
+
+                for (const d of snap.docs) {
+                    const data: any = d.data();
+
+                    const orderId = String(data.orderId ?? "");
+                    if (!orderId) continue;
+
+                    const lastAtMs = data.lastMessageAt?.toMillis?.() ?? 0;
+                    const lastSenderId = String(data.lastMessageSenderId ?? "");
+                    const readAtMs = data.lastReadAtCourier?.toMillis?.() ?? 0;
+
+                    const isUnread = lastAtMs > readAtMs && lastSenderId && lastSenderId !== user.uid;
+                    if (typeof isUnread === "boolean") {
+                        nextUnread[orderId] = isUnread;
+                    }
+
+                    // 🔔 beep только на новые сообщения (не на первый загрузочный снапшот)
+                    const prevMs = chatLastMsgAtByChatIdRef.current[d.id];
+
+                    if (typeof prevMs !== "number") {
+                        chatLastMsgAtByChatIdRef.current[d.id] = lastAtMs;
+                    } else if (lastAtMs > prevMs) {
+                        chatLastMsgAtByChatIdRef.current[d.id] = lastAtMs;
+
+                        // сообщение не от меня + чат закрыт -> бип
+                        const isChatClosed = !chatOpenRef.current[orderId];
+                        if (lastSenderId && lastSenderId !== user.uid && isChatClosed) {
+                            playChatBeep();
+                        }
+                    }
+                }
+
+                setUnreadByOrderId(nextUnread);
+            },
+            () => {}
+        );
+
+        return () => unsub();
+    }, [user]);
+
     useEffect(() => {
         if (!user) return;
 
@@ -680,6 +791,7 @@ export default function CourierAppHome() {
                                     const st: string | undefined = ord?.status;
                                     const canPickup = st === "taken";
                                     const canDeliver = st === "picked_up";
+                                    const readyText = readyInText(ord?.readyAtMs, nowMs);
 
                                     const code =
                                         typeof ord?.shortCode === "string" && ord.shortCode
@@ -718,6 +830,10 @@ export default function CourierAppHome() {
                               2 · PICKED UP
                             </span>
                                                         <span className="pill pill--muted">3 · DELIVERED</span>
+                                                        <span className={`pill ${readyText === "READY" ? "pill--success" : "pill--muted"}`}>
+  Ready in {readyText}
+</span>
+
                                                     </div>
                                                 </div>
 
@@ -810,7 +926,21 @@ export default function CourierAppHome() {
 
                                                     <button className="btn btn--ghost" onClick={() => toggleChat(ord.id)}>
                                                         {chatOpenByOrderId[ord.id] ? "Hide chat" : "Chat"}
+
+                                                        {!!unreadByOrderId[ord.id] && !chatOpenByOrderId[ord.id] && (
+                                                            <span
+                                                                style={{
+                                                                    display: "inline-block",
+                                                                    width: 8,
+                                                                    height: 8,
+                                                                    borderRadius: 999,
+                                                                    marginLeft: 8,
+                                                                    background: "crimson",
+                                                                }}
+                                                            />
+                                                        )}
                                                     </button>
+
 
                                                     {chatOpenByOrderId[ord.id] && (
                                                         <OrderChat
@@ -873,6 +1003,7 @@ export default function CourierAppHome() {
                                             typeof o.shortCode === "string" && o.shortCode
                                                 ? o.shortCode
                                                 : shortId(o.orderId);
+                                        const readyText = readyInText(o.readyAtMs, nowMs);
 
                                         return (
                                             <div key={o.id} className="subcard">
@@ -887,6 +1018,10 @@ export default function CourierAppHome() {
                             </span>
 
                                                         <span className="pill pill--success">Fee {money(o.deliveryFee)}</span>
+                                                        <span className={`pill ${readyText === "READY" ? "pill--success" : "pill--muted"}`}>
+  Ready in {readyText}
+</span>
+
                                                     </div>
 
                                                     {pickupMain && (

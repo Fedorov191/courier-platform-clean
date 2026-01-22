@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { onAuthStateChanged } from "firebase/auth";
 import { OrderChat } from "../components/OrderChat";
 
@@ -115,6 +115,58 @@ export function OrdersPage() {
     const [busyAction, setBusyAction] = useState<string | null>(null);
     const [chatOpenByOrderId, setChatOpenByOrderId] = useState<Record<string, boolean>>({});
 
+    // ✅ unread badges for chats (по chatId, чтобы не было конфликтов если менялся courier)
+    const [unreadByChatId, setUnreadByChatId] = useState<Record<string, boolean>>({});
+
+    // чтобы бипать только на "новые" сообщения, а не на первый снапшот
+    const chatLastMsgAtByChatIdRef = useRef<Record<string, number>>({});
+
+    // чтобы в onSnapshot видеть актуально открытые чаты (без ресабскрайба)
+    const chatOpenRef = useRef(chatOpenByOrderId);
+    useEffect(() => {
+        chatOpenRef.current = chatOpenByOrderId;
+    }, [chatOpenByOrderId]);
+
+    // =======================
+    // AUDIO: beep на новые сообщения
+    // =======================
+    const audioCtxRef = useRef<AudioContext | null>(null);
+
+    function primeAudio() {
+        const A = window.AudioContext || (window as any).webkitAudioContext;
+        if (!A) return;
+
+        if (!audioCtxRef.current) audioCtxRef.current = new A();
+
+        if (audioCtxRef.current.state === "suspended") {
+            audioCtxRef.current.resume().catch(() => {});
+        }
+    }
+
+    function playChatBeep() {
+        const ctx = audioCtxRef.current;
+        if (!ctx) return;
+
+        if (ctx.state === "suspended") {
+            ctx.resume().catch(() => {});
+            return;
+        }
+
+        const osc = ctx.createOscillator();
+        const gain = ctx.createGain();
+
+        osc.type = "sine";
+        osc.frequency.value = 660; // отличаем от оффер-бипа
+        gain.gain.value = 0.06;
+
+        osc.connect(gain);
+        gain.connect(ctx.destination);
+
+        const t0 = ctx.currentTime;
+        osc.start(t0);
+        osc.stop(t0 + 0.06);
+    }
+
     function toggleChat(orderId: string) {
         setChatOpenByOrderId((prev) => ({ ...prev, [orderId]: !prev[orderId] }));
     }
@@ -122,6 +174,13 @@ export function OrdersPage() {
     useEffect(() => {
         const unsub = onAuthStateChanged(auth, (u) => setUid(u?.uid ?? null));
         return () => unsub();
+    }, []);
+
+    // ✅ первый user gesture -> разрешаем аудио
+    useEffect(() => {
+        const handler = () => primeAudio();
+        window.addEventListener("pointerdown", handler, { once: true });
+        return () => window.removeEventListener("pointerdown", handler);
     }, []);
 
     // ✅ только UI подписка на заказы ресторана
@@ -189,7 +248,6 @@ export function OrdersPage() {
                     };
                 });
 
-
                 setOrders(list);
                 setLoading(false);
             },
@@ -197,6 +255,55 @@ export function OrdersPage() {
                 setError(e.message ?? "Firestore error");
                 setLoading(false);
             }
+        );
+
+        return () => unsub();
+    }, [uid]);
+
+    // ✅ subscribe to chats (restaurant) => unread + beep
+    useEffect(() => {
+        if (!uid) return;
+
+        const qChats = query(collection(db, "chats"), where("restaurantId", "==", uid));
+
+        const unsub = onSnapshot(
+            qChats,
+            (snap) => {
+                const nextUnread: Record<string, boolean> = {};
+
+                for (const d of snap.docs) {
+                    const data: any = d.data();
+
+                    const chatId = d.id;
+                    const orderId = String(data.orderId ?? "");
+                    if (!orderId) continue;
+
+                    const lastAtMs = data.lastMessageAt?.toMillis?.() ?? 0;
+                    const lastSenderId = String(data.lastMessageSenderId ?? "");
+                    const readAtMs = data.lastReadAtRestaurant?.toMillis?.() ?? 0;
+
+                    const isUnread = lastAtMs > readAtMs && lastSenderId && lastSenderId !== uid;
+                    if (typeof isUnread === "boolean") {
+                        nextUnread[chatId] = isUnread;
+                    }
+
+                    const prevMs = chatLastMsgAtByChatIdRef.current[chatId];
+
+                    if (typeof prevMs !== "number") {
+                        chatLastMsgAtByChatIdRef.current[chatId] = lastAtMs;
+                    } else if (lastAtMs > prevMs) {
+                        chatLastMsgAtByChatIdRef.current[chatId] = lastAtMs;
+
+                        const isChatClosed = !chatOpenRef.current[orderId];
+                        if (lastSenderId && lastSenderId !== uid && isChatClosed) {
+                            playChatBeep();
+                        }
+                    }
+                }
+
+                setUnreadByChatId(nextUnread);
+            },
+            () => {}
         );
 
         return () => unsub();
@@ -277,6 +384,15 @@ export function OrdersPage() {
         }
     }
 
+    async function markChatRead(chatId: string) {
+        try {
+            await updateDoc(doc(db, "chats", chatId), {
+                lastReadAtRestaurant: serverTimestamp(),
+                updatedAt: serverTimestamp(),
+            });
+        } catch {}
+    }
+
     if (!uid) {
         return (
             <div className="card">
@@ -345,7 +461,6 @@ export function OrdersPage() {
                     const isCash = o.paymentType === "cash";
                     const chatId = o.assignedCourierId ? `${o.id}_${o.assignedCourierId}` : null;
 
-                    // ✅ ВОТ ТУТ вычисляем код (до return)
                     const code =
                         typeof (o as any).shortCode === "string" && (o as any).shortCode
                             ? (o as any).shortCode
@@ -360,12 +475,12 @@ export function OrdersPage() {
                                     </div>
 
                                     <div className="row row--wrap">
-            <span className={`pill pill--${paymentTone(o.paymentType)}`}>
-              {paymentLabel(o.paymentType)}
-            </span>
+                                        <span className={`pill pill--${paymentTone(o.paymentType)}`}>
+                                            {paymentLabel(o.paymentType)}
+                                        </span>
                                         <span className={`pill pill--${statusTone(o.status)}`}>
-              {statusLabel(o.status)}
-            </span>
+                                            {statusLabel(o.status)}
+                                        </span>
                                     </div>
                                 </div>
 
@@ -454,11 +569,34 @@ export function OrdersPage() {
                                                 {busyAction === `remove:${o.id}` ? "Removing…" : "Remove courier"}
                                             </button>
                                         )}
+
                                         {chatId && (
-                                            <button className="btn btn--ghost" onClick={() => toggleChat(o.id)}>
+                                            <button
+                                                className="btn btn--ghost"
+                                                onClick={() => {
+                                                    primeAudio();
+                                                    const willOpen = !chatOpenByOrderId[o.id];
+                                                    toggleChat(o.id);
+                                                    if (willOpen) markChatRead(chatId);
+                                                }}
+                                            >
                                                 {chatOpenByOrderId[o.id] ? "Hide chat" : "Chat"}
+
+                                                {!!unreadByChatId[chatId] && !chatOpenByOrderId[o.id] && (
+                                                    <span
+                                                        style={{
+                                                            display: "inline-block",
+                                                            width: 8,
+                                                            height: 8,
+                                                            borderRadius: 999,
+                                                            marginLeft: 8,
+                                                            background: "crimson",
+                                                        }}
+                                                    />
+                                                )}
                                             </button>
                                         )}
+
                                         {chatId && chatOpenByOrderId[o.id] && (
                                             <OrderChat
                                                 chatId={chatId}
@@ -472,8 +610,8 @@ export function OrdersPage() {
 
                                         {o.assignedCourierId && (
                                             <span className="pill pill--muted">
-                        Courier: {(o.assignedCourierId || "").slice(0, 6).toUpperCase()}
-                      </span>
+                                                Courier: {(o.assignedCourierId || "").slice(0, 6).toUpperCase()}
+                                            </span>
                                         )}
                                     </div>
                                 )}
