@@ -16,7 +16,9 @@ import { AddressAutocomplete } from "../components/AddressAutocomplete";
 import type { AddressSuggestion } from "../components/AddressAutocomplete";
 
 type PaymentType = "cash" | "card";
-type PrepTimeMin = 20 | 30 | 40;
+
+const PREP_OPTIONS = [20, 30, 40] as const;
+type PrepTimeMin = (typeof PREP_OPTIONS)[number];
 
 type FormState = {
     customerName: string;
@@ -33,6 +35,7 @@ type FormState = {
 type Errors =
     Partial<Record<keyof FormState, string>> & {
     customerAddressPick?: string;
+    prepTimeMin?: string;
     quote?: string;
 };
 
@@ -83,7 +86,8 @@ export function NewOrderPage() {
     const [submitError, setSubmitError] = useState("");
     const [wasSubmitted, setWasSubmitted] = useState(false);
 
-    const [prepTimeMin, setPrepTimeMin] = useState<PrepTimeMin>(20);
+    // ✅ ОБЯЗАТЕЛЬНО: по умолчанию НИЧЕГО не выбрано
+    const [prepTimeMin, setPrepTimeMin] = useState<PrepTimeMin | null>(null);
 
     const [dropoff, setDropoff] = useState<{
         lat: number | null;
@@ -168,6 +172,18 @@ export function NewOrderPage() {
         };
     }, [uid]);
 
+    const hasPickupCoords =
+        typeof pickup.lat === "number" &&
+        typeof pickup.lng === "number" &&
+        typeof pickup.geohash === "string" &&
+        !!pickup.geohash;
+
+    const hasDropoffCoords =
+        typeof dropoff.lat === "number" &&
+        typeof dropoff.lng === "number" &&
+        typeof dropoff.geohash === "string" &&
+        !!dropoff.geohash;
+
     // Re-calc quote when we have both coords
     useEffect(() => {
         let cancelled = false;
@@ -175,10 +191,7 @@ export function NewOrderPage() {
         async function run() {
             setQuoteError("");
 
-            const hasPickup = typeof pickup.lat === "number" && typeof pickup.lng === "number";
-            const hasDropoff = typeof dropoff.lat === "number" && typeof dropoff.lng === "number";
-
-            if (!hasPickup || !hasDropoff) {
+            if (!hasPickupCoords || !hasDropoffCoords) {
                 setQuote(null);
                 return;
             }
@@ -210,7 +223,8 @@ export function NewOrderPage() {
         return () => {
             cancelled = true;
         };
-    }, [pickup.lat, pickup.lng, dropoff.lat, dropoff.lng]);
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [pickup.lat, pickup.lng, pickup.geohash, dropoff.lat, dropoff.lng, dropoff.geohash]);
 
     const update = (key: keyof FormState, value: any) => {
         setForm((prev) => ({ ...prev, [key]: value }));
@@ -222,24 +236,27 @@ export function NewOrderPage() {
     const errors: Errors = useMemo(() => {
         const e: Errors = {};
 
+        // ✅ обязательное время
+        if (prepTimeMin === null) {
+            e.prepTimeMin = "Выбери время готовности (20/30/40 минут).";
+        }
+
         if (form.customerName.trim().length < 2) e.customerName = "Укажи имя клиента.";
 
         const phoneDigits = onlyDigits(form.customerPhone);
-        if (phoneDigits.length < 9) e.customerPhone = "Телефон должен содержать минимум 9 цифр (обычно 10).";
+        if (phoneDigits.length < 9) {
+            e.customerPhone = "Телефон должен содержать минимум 9 цифр (обычно 10).";
+        }
 
         if (form.customerAddress.trim().length < 5) e.customerAddress = "Начни вводить адрес доставки.";
-        if (!(dropoff.lat && dropoff.lng && dropoff.geohash)) {
-            e.customerAddressPick = "Выбери адрес из подсказок (чтобы были координаты).";
-        }
+        if (!hasDropoffCoords) e.customerAddressPick = "Выбери адрес из подсказок (чтобы были координаты).";
 
         if (!Number.isFinite(subtotal) || subtotal <= 0) {
             e.orderSubtotal = "Стоимость заказа должна быть > 0 (например 100).";
         }
 
-        // quote обязателен, если адрес выбран
-        const hasPickup = typeof pickup.lat === "number" && typeof pickup.lng === "number";
-        const hasDropoff = typeof dropoff.lat === "number" && typeof dropoff.lng === "number";
-        if (hasPickup && hasDropoff && !quoteLoading) {
+        // quote обязателен, когда обе точки есть
+        if (hasPickupCoords && hasDropoffCoords && !quoteLoading) {
             if (!quote || !Number.isFinite(fee) || fee < 0) {
                 e.quote = quoteError || "Не удалось рассчитать доставку по маршруту.";
             }
@@ -251,30 +268,30 @@ export function NewOrderPage() {
         form.customerPhone,
         form.customerAddress,
         form.orderSubtotal,
-        dropoff.lat,
-        dropoff.lng,
-        dropoff.geohash,
-        pickup.lat,
-        pickup.lng,
-        quote,
-        quoteLoading,
-        quoteError,
         subtotal,
+        prepTimeMin,
+        hasPickupCoords,
+        hasDropoffCoords,
+        quoteLoading,
+        quote,
         fee,
+        quoteError,
     ]);
 
     const canSubmit =
         Object.keys(errors).length === 0 &&
+        !loading &&
         !quoteLoading &&
+        hasPickupCoords &&
+        hasDropoffCoords &&
         !!quote &&
         Number.isFinite(subtotal) &&
         subtotal > 0 &&
         Number.isFinite(fee) &&
-        fee >= 0;
+        fee >= 0 &&
+        prepTimeMin !== null;
 
-    const orderTotal =
-        (Number.isFinite(subtotal) ? subtotal : 0) +
-        (Number.isFinite(fee) ? fee : 0);
+    const orderTotal = (Number.isFinite(subtotal) ? subtotal : 0) + (Number.isFinite(fee) ? fee : 0);
 
     const moneyFlow = useMemo(() => {
         if (!Number.isFinite(subtotal) || !Number.isFinite(fee)) {
@@ -310,25 +327,14 @@ export function NewOrderPage() {
             return;
         }
 
+        // даже если кнопка disabled — защита тут обязательна
         if (!canSubmit) return;
-
-        if (!(typeof pickup.lat === "number" && typeof pickup.lng === "number" && pickup.geohash)) {
-            setSubmitError("Сначала укажи pickup-адрес ресторана (из подсказок), чтобы были координаты.");
-            return;
-        }
-        if (!(typeof dropoff.lat === "number" && typeof dropoff.lng === "number" && dropoff.geohash)) {
-            setSubmitError("Выбери адрес доставки из подсказок, чтобы были координаты.");
-            return;
-        }
-        if (!quote || !Number.isFinite(fee)) {
-            setSubmitError("Не удалось рассчитать delivery fee. Проверь адрес и попробуй ещё раз.");
-            return;
-        }
+        if (prepTimeMin === null) return;
 
         setLoading(true);
 
         try {
-            // фиксируем readyAtMs при создании
+            // ✅ фиксируем readyAtMs при создании (таймер будет одинаков для всех)
             const readyAtMs = Date.now() + prepTimeMin * 60_000;
 
             const orderDoc: any = {
@@ -366,10 +372,10 @@ export function NewOrderPage() {
                 courierCollectsFromCustomer: moneyFlow.courierCollectsFromCustomer,
                 courierGetsFromRestaurantAtPickup: moneyFlow.courierGetsFromRestaurantAtPickup,
 
-                // route info (from Google Routes)
-                routeDistanceMeters: quote.distanceMeters,
-                routeDurationSeconds: quote.durationSeconds,
-                pricingVersion: quote.pricingVersion ?? "v1",
+                // route info
+                routeDistanceMeters: quote!.distanceMeters,
+                routeDurationSeconds: quote!.durationSeconds,
+                pricingVersion: quote!.pricingVersion ?? "v1",
 
                 // prep time
                 prepTimeMin,
@@ -397,9 +403,7 @@ export function NewOrderPage() {
 
             await runTransaction(db, async (tx) => {
                 const counterSnap = await tx.get(counterRef);
-                const lastSeq = counterSnap.exists()
-                    ? Number((counterSnap.data() as any)?.lastSeq ?? 0)
-                    : 0;
+                const lastSeq = counterSnap.exists() ? Number((counterSnap.data() as any)?.lastSeq ?? 0) : 0;
 
                 const nextSeq = lastSeq + 1;
                 if (nextSeq > 999) throw new Error("Daily order limit reached (999).");
@@ -407,11 +411,7 @@ export function NewOrderPage() {
                 const shortCode = String(nextSeq).padStart(3, "0");
                 const publicCode = `${dateKey}-${shortCode}`;
 
-                tx.set(
-                    counterRef,
-                    { lastSeq: nextSeq, updatedAt: serverTimestamp() },
-                    { merge: true }
-                );
+                tx.set(counterRef, { lastSeq: nextSeq, updatedAt: serverTimestamp() }, { merge: true });
 
                 tx.set(orderRef, {
                     ...orderDoc,
@@ -447,7 +447,7 @@ export function NewOrderPage() {
 
     const FieldError = ({ text }: { text?: string }) => {
         if (!text) return null;
-        return <div style={{ fontSize: 12, color: "crimson", marginTop: 4 }}>{text}</div>;
+        return <div style={{ fontSize: 12, color: "crimson", marginTop: 6 }}>{text}</div>;
     };
 
     function onDropoffPick(s: AddressSuggestion) {
@@ -470,7 +470,7 @@ export function NewOrderPage() {
     async function savePickupToRestaurantProfile() {
         if (!uid) return;
 
-        if (!(pickup.lat && pickup.lng && pickup.geohash)) {
+        if (!(typeof pickup.lat === "number" && typeof pickup.lng === "number" && pickup.geohash)) {
             setPickupSaveError("Выбери адрес ресторана из подсказок (нужны координаты).");
             return;
         }
@@ -650,21 +650,20 @@ export function NewOrderPage() {
 
                 <hr />
 
-                {/* Prep time */}
+                {/* Prep time (REQUIRED) */}
                 <div style={{ padding: 12, border: "1px solid #333", borderRadius: 12 }}>
                     <div style={{ fontSize: 12, color: "#aaa", marginBottom: 8 }}>
-                        Order ready time
+                        Order ready time (required)
                     </div>
 
                     <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
-                        {[20, 30, 40].map((m) => {
-                            const mm = m as PrepTimeMin;
-                            const active = prepTimeMin === mm;
+                        {PREP_OPTIONS.map((m) => {
+                            const active = prepTimeMin === m;
                             return (
                                 <button
                                     key={m}
                                     type="button"
-                                    onClick={() => setPrepTimeMin(mm)}
+                                    onClick={() => setPrepTimeMin(m)}
                                     style={{
                                         padding: "8px 12px",
                                         borderRadius: 10,
@@ -680,7 +679,15 @@ export function NewOrderPage() {
                         })}
                     </div>
 
-                    <div style={{ marginTop: 10, fontSize: 12, color: "#888" }}>
+                    {prepTimeMin === null && !showErrors && (
+                        <div style={{ marginTop: 8, fontSize: 12, color: "#888" }}>
+                            Выбери время готовности, чтобы активировать “Create order”.
+                        </div>
+                    )}
+
+                    <FieldError text={showErrors ? errors.prepTimeMin : undefined} />
+
+                    <div style={{ marginTop: 8, fontSize: 12, color: "#888" }}>
                         Курьер увидит таймер “готово через …” в оффере и в активном заказе.
                     </div>
                 </div>
@@ -698,6 +705,7 @@ export function NewOrderPage() {
                             />
                             Cash
                         </label>
+
                         <label style={{ display: "flex", gap: 6, alignItems: "center" }}>
                             <input
                                 type="radio"
@@ -733,8 +741,12 @@ export function NewOrderPage() {
                     <div style={{ marginTop: 8, fontSize: 13, color: "#ddd" }}>
                         {quote ? (
                             <>
-                                <div>Distance (route): <b>{quote.distanceKm.toFixed(2)} km</b></div>
-                                <div>ETA (route): <b>{Math.round(quote.durationSeconds / 60)} min</b></div>
+                                <div>
+                                    Distance (route): <b>{quote.distanceKm.toFixed(2)} km</b>
+                                </div>
+                                <div>
+                                    ETA (route): <b>{Math.round(quote.durationSeconds / 60)} min</b>
+                                </div>
                             </>
                         ) : (
                             <div style={{ color: "#888" }}>
@@ -777,7 +789,9 @@ export function NewOrderPage() {
                             </>
                         ) : (
                             <>
-                                <div>Курьер берет с клиента: <b>₪0.00</b></div>
+                                <div>
+                                    Курьер берет с клиента: <b>₪0.00</b>
+                                </div>
                                 <div>
                                     Ресторан выдает курьеру (доставка):{" "}
                                     <b>₪{moneyFlow.courierGetsFromRestaurantAtPickup.toFixed(2)}</b>
@@ -788,13 +802,13 @@ export function NewOrderPage() {
                 </div>
 
                 <button
-                    disabled={loading || quoteLoading || !canSubmit}
+                    disabled={!canSubmit}
                     style={{
                         padding: 12,
                         borderRadius: 10,
                         border: "1px solid #333",
-                        cursor: loading || quoteLoading || !canSubmit ? "not-allowed" : "pointer",
-                        opacity: loading || quoteLoading || !canSubmit ? 0.7 : 1,
+                        cursor: !canSubmit ? "not-allowed" : "pointer",
+                        opacity: !canSubmit ? 0.7 : 1,
                     }}
                 >
                     {loading ? "Creating…" : "Create order"}
