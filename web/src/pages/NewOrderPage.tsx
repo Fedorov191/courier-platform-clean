@@ -1,4 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import type { FormEvent } from "react";
+
 import { onAuthStateChanged } from "firebase/auth";
 import { auth, db, functions } from "../lib/firebase";
 import {
@@ -12,8 +14,9 @@ import {
 import { httpsCallable } from "firebase/functions";
 import { Link, useNavigate } from "react-router-dom";
 import { geohashForLocation } from "geofire-common";
-import { AddressAutocomplete } from "../components/AddressAutocomplete";
-import type { AddressSuggestion } from "../components/AddressAutocomplete";
+import { GooglePlacesAutocomplete } from "../components/GooglePlacesAutocomplete";
+import type { PlacePick } from "../components/GooglePlacesAutocomplete";
+
 
 type PaymentType = "cash" | "card";
 
@@ -23,20 +26,24 @@ type PrepTimeMin = (typeof PREP_OPTIONS)[number];
 type FormState = {
     customerName: string;
     customerPhone: string;
-    customerAddress: string;
+
+    dropoffAddressText: string; // “красивая строка” (из Google)
+    dropoffStreet: string;
+    dropoffHouseNumber: string;
+    dropoffApartment: string; // optional
+    dropoffEntrance: string;  // optional
+    dropoffComment: string;   // optional, но поле обязано быть в UI
 
     orderSubtotal: string;
     paymentType: PaymentType;
-
-    // один комментарий только по доставке (домофон/подъезд/оставить у двери)
-    notes: string;
 };
 
 type Errors =
     Partial<Record<keyof FormState, string>> & {
-    customerAddressPick?: string;
+    dropoffPick?: string;
     prepTimeMin?: string;
     quote?: string;
+    pickupMissing?: string;
 };
 
 type RouteQuote = {
@@ -63,7 +70,7 @@ function israelDateKey(d = new Date()) {
     const y = parts.find((p) => p.type === "year")?.value ?? "0000";
     const m = parts.find((p) => p.type === "month")?.value ?? "00";
     const day = parts.find((p) => p.type === "day")?.value ?? "00";
-    return `${y}-${m}-${day}`; // YYYY-MM-DD
+    return `${y}-${m}-${day}`;
 }
 
 function toNumber(s: string) {
@@ -86,34 +93,45 @@ export function NewOrderPage() {
     const [submitError, setSubmitError] = useState("");
     const [wasSubmitted, setWasSubmitted] = useState(false);
 
-    // ✅ ОБЯЗАТЕЛЬНО: по умолчанию НИЧЕГО не выбрано
+    // ✅ время готовности обязательно выбирать
     const [prepTimeMin, setPrepTimeMin] = useState<PrepTimeMin | null>(null);
 
-    const [dropoff, setDropoff] = useState<{
-        lat: number | null;
-        lng: number | null;
-        geohash: string | null;
-        label: string | null;
-    }>({ lat: null, lng: null, geohash: null, label: null });
-
+    // pickup (restaurant)
     const [pickup, setPickup] = useState<{
         lat: number | null;
         lng: number | null;
         geohash: string | null;
-        label: string | null;
-    }>({ lat: null, lng: null, geohash: null, label: null });
+        label: string;
+        placeId: string | null;
+    }>({ lat: null, lng: null, geohash: null, label: "", placeId: null });
 
     const [pickupLoaded, setPickupLoaded] = useState(false);
     const [pickupSaving, setPickupSaving] = useState(false);
     const [pickupSaveError, setPickupSaveError] = useState<string>("");
+    const [pickupEditMode, setPickupEditMode] = useState(true);
+
+    // dropoff
+    const [dropoff, setDropoff] = useState<{
+        lat: number | null;
+        lng: number | null;
+        geohash: string | null;
+        label: string;
+        placeId: string | null;
+    }>({ lat: null, lng: null, geohash: null, label: "", placeId: null });
 
     const [form, setForm] = useState<FormState>({
         customerName: "",
         customerPhone: "",
-        customerAddress: "",
+
+        dropoffAddressText: "",
+        dropoffStreet: "",
+        dropoffHouseNumber: "",
+        dropoffApartment: "",
+        dropoffEntrance: "",
+        dropoffComment: "",
+
         orderSubtotal: "",
         paymentType: "cash",
-        notes: "",
     });
 
     // =========================
@@ -152,11 +170,15 @@ export function NewOrderPage() {
                         ? geohashForLocation([lat, lng])
                         : null);
 
-                const label = data?.pickupAddressText ?? data?.address ?? null;
+                const label = String(data?.pickupAddressText ?? data?.address ?? "");
+                const placeId = typeof data?.pickupPlaceId === "string" ? data.pickupPlaceId : null;
 
                 if (!cancelled) {
-                    setPickup({ lat, lng, geohash, label });
+                    setPickup({ lat, lng, geohash, label, placeId });
                     setPickupLoaded(true);
+
+                    const hasSaved = typeof lat === "number" && typeof lng === "number" && !!geohash;
+                    setPickupEditMode(!hasSaved);
                 }
             } catch (e: any) {
                 if (!cancelled) {
@@ -172,18 +194,6 @@ export function NewOrderPage() {
         };
     }, [uid]);
 
-    const hasPickupCoords =
-        typeof pickup.lat === "number" &&
-        typeof pickup.lng === "number" &&
-        typeof pickup.geohash === "string" &&
-        !!pickup.geohash;
-
-    const hasDropoffCoords =
-        typeof dropoff.lat === "number" &&
-        typeof dropoff.lng === "number" &&
-        typeof dropoff.geohash === "string" &&
-        !!dropoff.geohash;
-
     // Re-calc quote when we have both coords
     useEffect(() => {
         let cancelled = false;
@@ -191,7 +201,10 @@ export function NewOrderPage() {
         async function run() {
             setQuoteError("");
 
-            if (!hasPickupCoords || !hasDropoffCoords) {
+            const hasPickup = typeof pickup.lat === "number" && typeof pickup.lng === "number";
+            const hasDropoff = typeof dropoff.lat === "number" && typeof dropoff.lng === "number";
+
+            if (!hasPickup || !hasDropoff) {
                 setQuote(null);
                 return;
             }
@@ -223,20 +236,85 @@ export function NewOrderPage() {
         return () => {
             cancelled = true;
         };
-        // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [pickup.lat, pickup.lng, pickup.geohash, dropoff.lat, dropoff.lng, dropoff.geohash]);
+    }, [pickup.lat, pickup.lng, dropoff.lat, dropoff.lng]);
 
     const update = (key: keyof FormState, value: any) => {
         setForm((prev) => ({ ...prev, [key]: value }));
     };
 
+    // ======== Dropoff handlers (Google Places) ========
+    function onDropoffPick(p: PlacePick) {
+        const gh = geohashForLocation([p.lat, p.lng]);
+        setDropoff({ lat: p.lat, lng: p.lng, geohash: gh, label: p.label, placeId: p.placeId });
+
+        update("dropoffAddressText", p.label);
+
+        // ✅ автозаполняем street/house, но оставляем редактируемым
+        if (p.street) update("dropoffStreet", p.street);
+        if (p.houseNumber) update("dropoffHouseNumber", p.houseNumber);
+
+        // subpremise если есть
+        if (p.apartment && !form.dropoffApartment) update("dropoffApartment", p.apartment);
+    }
+
+    function onDropoffTextChange(v: string) {
+        // если пользователь печатает вручную — сбрасываем координаты
+        setDropoff({ lat: null, lng: null, geohash: null, label: v, placeId: null });
+        update("dropoffAddressText", v);
+    }
+
+    // ======== Pickup handlers (Google Places) ========
+    function onPickupPick(p: PlacePick) {
+        const gh = geohashForLocation([p.lat, p.lng]);
+        setPickup({ lat: p.lat, lng: p.lng, geohash: gh, label: p.label, placeId: p.placeId });
+        setPickupSaveError("");
+    }
+
+    function onPickupTextChange(v: string) {
+        setPickup({ lat: null, lng: null, geohash: null, label: v, placeId: null });
+        setPickupSaveError("");
+    }
+
+    async function savePickupToRestaurantProfile() {
+        if (!uid) return;
+
+        if (!(typeof pickup.lat === "number" && typeof pickup.lng === "number" && pickup.geohash)) {
+            setPickupSaveError("Выбери адрес ресторана из подсказок (нужны координаты).");
+            return;
+        }
+
+        setPickupSaving(true);
+        setPickupSaveError("");
+
+        try {
+            await setDoc(
+                doc(db, "restaurants", uid),
+                {
+                    pickupLat: pickup.lat,
+                    pickupLng: pickup.lng,
+                    pickupGeohash: pickup.geohash,
+                    pickupAddressText: pickup.label ?? "",
+                    pickupPlaceId: pickup.placeId ?? null,
+                    updatedAt: serverTimestamp(),
+                },
+                { merge: true }
+            );
+
+            setPickupEditMode(false);
+        } catch (e: any) {
+            setPickupSaveError(e?.message ?? "Failed to save pickup location");
+        } finally {
+            setPickupSaving(false);
+        }
+    }
+
+    // ======== Pricing ========
     const subtotal = toNumber(form.orderSubtotal);
     const fee = typeof quote?.deliveryFee === "number" ? quote.deliveryFee : NaN;
 
     const errors: Errors = useMemo(() => {
         const e: Errors = {};
 
-        // ✅ обязательное время
         if (prepTimeMin === null) {
             e.prepTimeMin = "Выбери время готовности (20/30/40 минут).";
         }
@@ -248,15 +326,31 @@ export function NewOrderPage() {
             e.customerPhone = "Телефон должен содержать минимум 9 цифр (обычно 10).";
         }
 
-        if (form.customerAddress.trim().length < 5) e.customerAddress = "Начни вводить адрес доставки.";
-        if (!hasDropoffCoords) e.customerAddressPick = "Выбери адрес из подсказок (чтобы были координаты).";
+        // Dropoff must be picked (coords + placeId)
+        if (form.dropoffAddressText.trim().length < 5) {
+            e.dropoffAddressText = "Начни вводить адрес доставки.";
+        }
+        if (!(dropoff.lat && dropoff.lng && dropoff.geohash && dropoff.placeId)) {
+            e.dropoffPick = "Выбери адрес из подсказок Google (нужны координаты и placeId).";
+        }
+
+        // ✅ structured fields required
+        if (form.dropoffStreet.trim().length < 2) e.dropoffStreet = "Укажи улицу.";
+        if (form.dropoffHouseNumber.trim().length < 1) e.dropoffHouseNumber = "Укажи номер дома.";
 
         if (!Number.isFinite(subtotal) || subtotal <= 0) {
             e.orderSubtotal = "Стоимость заказа должна быть > 0 (например 100).";
         }
 
-        // quote обязателен, когда обе точки есть
-        if (hasPickupCoords && hasDropoffCoords && !quoteLoading) {
+        // pickup must exist (coords) to compute route
+        const hasPickup = typeof pickup.lat === "number" && typeof pickup.lng === "number";
+        if (!hasPickup) {
+            e.pickupMissing = "Нужен pickup адрес ресторана (с координатами).";
+        }
+
+        // quote required after both coords
+        const hasDropoff = typeof dropoff.lat === "number" && typeof dropoff.lng === "number";
+        if (hasPickup && hasDropoff && !quoteLoading) {
             if (!quote || !Number.isFinite(fee) || fee < 0) {
                 e.quote = quoteError || "Не удалось рассчитать доставку по маршруту.";
             }
@@ -264,34 +358,37 @@ export function NewOrderPage() {
 
         return e;
     }, [
+        prepTimeMin,
         form.customerName,
         form.customerPhone,
-        form.customerAddress,
+        form.dropoffAddressText,
+        form.dropoffStreet,
+        form.dropoffHouseNumber,
         form.orderSubtotal,
-        subtotal,
-        prepTimeMin,
-        hasPickupCoords,
-        hasDropoffCoords,
-        quoteLoading,
+        pickup.lat,
+        pickup.lng,
+        dropoff.lat,
+        dropoff.lng,
+        dropoff.geohash,
+        dropoff.placeId,
         quote,
-        fee,
+        quoteLoading,
         quoteError,
+        subtotal,
+        fee,
     ]);
 
     const canSubmit =
         Object.keys(errors).length === 0 &&
-        !loading &&
         !quoteLoading &&
-        hasPickupCoords &&
-        hasDropoffCoords &&
         !!quote &&
         Number.isFinite(subtotal) &&
         subtotal > 0 &&
         Number.isFinite(fee) &&
-        fee >= 0 &&
-        prepTimeMin !== null;
+        fee >= 0;
 
-    const orderTotal = (Number.isFinite(subtotal) ? subtotal : 0) + (Number.isFinite(fee) ? fee : 0);
+    const orderTotal =
+        (Number.isFinite(subtotal) ? subtotal : 0) + (Number.isFinite(fee) ? fee : 0);
 
     const moneyFlow = useMemo(() => {
         if (!Number.isFinite(subtotal) || !Number.isFinite(fee)) {
@@ -317,7 +414,7 @@ export function NewOrderPage() {
         };
     }, [form.paymentType, subtotal, fee]);
 
-    const onSubmit = async (e: React.FormEvent) => {
+    const onSubmit = async (e: FormEvent) => {
         e.preventDefault();
         setSubmitError("");
         setWasSubmitted(true);
@@ -327,39 +424,62 @@ export function NewOrderPage() {
             return;
         }
 
-        // даже если кнопка disabled — защита тут обязательна
         if (!canSubmit) return;
         if (prepTimeMin === null) return;
+
+        if (!(typeof pickup.lat === "number" && typeof pickup.lng === "number" && pickup.geohash)) {
+            setSubmitError("Сначала укажи pickup-адрес ресторана (из подсказок), чтобы были координаты.");
+            return;
+        }
+        if (!(typeof dropoff.lat === "number" && typeof dropoff.lng === "number" && dropoff.geohash && dropoff.placeId)) {
+            setSubmitError("Выбери адрес доставки из подсказок Google, чтобы были координаты.");
+            return;
+        }
+        if (!quote || !Number.isFinite(fee)) {
+            setSubmitError("Не удалось рассчитать delivery fee. Проверь адрес и попробуй ещё раз.");
+            return;
+        }
 
         setLoading(true);
 
         try {
-            // ✅ фиксируем readyAtMs при создании (таймер будет одинаков для всех)
             const readyAtMs = Date.now() + prepTimeMin * 60_000;
 
             const orderDoc: any = {
+                // owner
+                restaurantId: uid,
+
                 // pickup
                 pickupLat: pickup.lat,
                 pickupLng: pickup.lng,
                 pickupGeohash: pickup.geohash,
                 pickupAddressText: pickup.label ?? "",
+                pickupPlaceId: pickup.placeId ?? null,
 
-                // owner
-                restaurantId: uid,
+                // prep time
+                prepTimeMin,
+                readyAtMs,
 
                 // customer
                 customerName: form.customerName.trim(),
                 customerPhone: form.customerPhone.trim(),
-                customerAddress: form.customerAddress.trim(),
 
-                // comment (delivery only)
-                notes: form.notes.trim(),
-
-                // dropoff
+                // structured dropoff
+                dropoffPlaceId: dropoff.placeId,
                 dropoffLat: dropoff.lat,
                 dropoffLng: dropoff.lng,
                 dropoffGeohash: dropoff.geohash,
-                dropoffAddressText: dropoff.label ?? form.customerAddress.trim(),
+                dropoffAddressText: form.dropoffAddressText.trim(),
+
+                dropoffStreet: form.dropoffStreet.trim(),
+                dropoffHouseNumber: form.dropoffHouseNumber.trim(),
+                dropoffApartment: form.dropoffApartment.trim() || null,
+                dropoffEntrance: form.dropoffEntrance.trim() || null,
+                dropoffComment: form.dropoffComment.trim() || null,
+
+                // backward compatibility (старые поля)
+                customerAddress: form.dropoffAddressText.trim(),
+                notes: form.dropoffComment.trim(), // раньше у тебя это было “notes” — оставим, чтобы ничего не сломать
 
                 // payment
                 paymentType: form.paymentType,
@@ -372,14 +492,14 @@ export function NewOrderPage() {
                 courierCollectsFromCustomer: moneyFlow.courierCollectsFromCustomer,
                 courierGetsFromRestaurantAtPickup: moneyFlow.courierGetsFromRestaurantAtPickup,
 
-                // route info
-                routeDistanceMeters: quote!.distanceMeters,
-                routeDurationSeconds: quote!.durationSeconds,
-                pricingVersion: quote!.pricingVersion ?? "v1",
+                // route info (Routes API)
+                routeDistanceMeters: quote.distanceMeters,
+                routeDurationSeconds: quote.durationSeconds,
+                pricingVersion: quote.pricingVersion ?? "v1",
 
-                // prep time
-                prepTimeMin,
-                readyAtMs,
+                // (по промпту — можно хранить и “deliveryDistance…”)
+                deliveryDistanceMeters: quote.distanceMeters,
+                deliveryDistanceKm: quote.distanceKm,
 
                 // assignment
                 status: "new",
@@ -403,7 +523,9 @@ export function NewOrderPage() {
 
             await runTransaction(db, async (tx) => {
                 const counterSnap = await tx.get(counterRef);
-                const lastSeq = counterSnap.exists() ? Number((counterSnap.data() as any)?.lastSeq ?? 0) : 0;
+                const lastSeq = counterSnap.exists()
+                    ? Number((counterSnap.data() as any)?.lastSeq ?? 0)
+                    : 0;
 
                 const nextSeq = lastSeq + 1;
                 if (nextSeq > 999) throw new Error("Daily order limit reached (999).");
@@ -411,7 +533,11 @@ export function NewOrderPage() {
                 const shortCode = String(nextSeq).padStart(3, "0");
                 const publicCode = `${dateKey}-${shortCode}`;
 
-                tx.set(counterRef, { lastSeq: nextSeq, updatedAt: serverTimestamp() }, { merge: true });
+                tx.set(
+                    counterRef,
+                    { lastSeq: nextSeq, updatedAt: serverTimestamp() },
+                    { merge: true }
+                );
 
                 tx.set(orderRef, {
                     ...orderDoc,
@@ -447,60 +573,8 @@ export function NewOrderPage() {
 
     const FieldError = ({ text }: { text?: string }) => {
         if (!text) return null;
-        return <div style={{ fontSize: 12, color: "crimson", marginTop: 6 }}>{text}</div>;
+        return <div style={{ fontSize: 12, color: "crimson", marginTop: 4 }}>{text}</div>;
     };
-
-    function onDropoffPick(s: AddressSuggestion) {
-        const gh = geohashForLocation([s.lat, s.lng]);
-        setDropoff({ lat: s.lat, lng: s.lng, geohash: gh, label: s.label });
-        update("customerAddress", s.label);
-    }
-
-    function onPickupPick(s: AddressSuggestion) {
-        const gh = geohashForLocation([s.lat, s.lng]);
-        setPickup({ lat: s.lat, lng: s.lng, geohash: gh, label: s.label });
-        setPickupSaveError("");
-    }
-
-    function onPickupTextChange(v: string) {
-        setPickup({ lat: null, lng: null, geohash: null, label: v });
-        setPickupSaveError("");
-    }
-
-    async function savePickupToRestaurantProfile() {
-        if (!uid) return;
-
-        if (!(typeof pickup.lat === "number" && typeof pickup.lng === "number" && pickup.geohash)) {
-            setPickupSaveError("Выбери адрес ресторана из подсказок (нужны координаты).");
-            return;
-        }
-
-        setPickupSaving(true);
-        setPickupSaveError("");
-
-        try {
-            await setDoc(
-                doc(db, "restaurants", uid),
-                {
-                    pickupLat: pickup.lat,
-                    pickupLng: pickup.lng,
-                    pickupGeohash: pickup.geohash,
-                    pickupAddressText: pickup.label ?? "",
-                    updatedAt: serverTimestamp(),
-                },
-                { merge: true }
-            );
-        } catch (e: any) {
-            setPickupSaveError(e?.message ?? "Failed to save pickup location");
-        } finally {
-            setPickupSaving(false);
-        }
-    }
-
-    function onDropoffTextChange(v: string) {
-        setDropoff({ lat: null, lng: null, geohash: null, label: null });
-        update("customerAddress", v);
-    }
 
     if (authLoading) {
         return (
@@ -545,50 +619,78 @@ export function NewOrderPage() {
                 {/* Restaurant pickup */}
                 <div style={{ padding: 12, border: "1px solid #333", borderRadius: 12 }}>
                     <div style={{ fontSize: 12, color: "#aaa", marginBottom: 6 }}>
-                        Restaurant pickup location
+                        Restaurant pickup location (Google Places)
                     </div>
 
                     {!pickupLoaded ? (
                         <div style={{ color: "#888", fontSize: 13 }}>Loading pickup…</div>
-                    ) : pickup.lat && pickup.lng && pickup.geohash ? (
-                        <div style={{ fontSize: 13 }}>
-                            Saved: <b>{pickup.label ?? "—"}</b>
-                        </div>
                     ) : (
                         <>
-                            <AddressAutocomplete
-                                placeholder="Pickup address (restaurant) — start typing..."
-                                value={pickup.label ?? ""}
-                                onChangeText={onPickupTextChange}
-                                onPick={onPickupPick}
-                                disabled={loading || pickupSaving}
-                            />
+                            {!pickupEditMode && pickup.lat && pickup.lng && pickup.geohash ? (
+                                <>
+                                    <div style={{ fontSize: 13 }}>
+                                        Saved: <b>{pickup.label || "—"}</b>
+                                    </div>
 
-                            <div style={{ height: 8 }} />
+                                    <div style={{ height: 8 }} />
 
-                            <button
-                                type="button"
-                                onClick={savePickupToRestaurantProfile}
-                                disabled={pickupSaving}
-                                style={{
-                                    padding: "8px 12px",
-                                    borderRadius: 10,
-                                    border: "1px solid #333",
-                                    cursor: pickupSaving ? "not-allowed" : "pointer",
-                                }}
-                            >
-                                {pickupSaving ? "Saving…" : "Save pickup location"}
-                            </button>
+                                    <button
+                                        type="button"
+                                        onClick={() => setPickupEditMode(true)}
+                                        style={{
+                                            padding: "8px 12px",
+                                            borderRadius: 10,
+                                            border: "1px solid #333",
+                                            cursor: "pointer",
+                                        }}
+                                    >
+                                        Change pickup location
+                                    </button>
+                                </>
+                            ) : (
+                                <>
+                                    <GooglePlacesAutocomplete
+                                        placeholder="Pickup address (restaurant) — start typing..."
+                                        value={pickup.label}
+                                        onChangeText={onPickupTextChange}
+                                        onPick={onPickupPick}
+                                        disabled={loading || pickupSaving}
+                                        country="il"
+                                    />
 
-                            {pickupSaveError && (
-                                <div style={{ color: "crimson", marginTop: 8, fontSize: 12 }}>
-                                    {pickupSaveError}
-                                </div>
+                                    <div style={{ height: 8 }} />
+
+                                    <button
+                                        type="button"
+                                        onClick={savePickupToRestaurantProfile}
+                                        disabled={pickupSaving}
+                                        style={{
+                                            padding: "8px 12px",
+                                            borderRadius: 10,
+                                            border: "1px solid #333",
+                                            cursor: pickupSaving ? "not-allowed" : "pointer",
+                                        }}
+                                    >
+                                        {pickupSaving ? "Saving…" : "Save pickup location"}
+                                    </button>
+
+                                    {pickupSaveError && (
+                                        <div style={{ color: "crimson", marginTop: 8, fontSize: 12 }}>
+                                            {pickupSaveError}
+                                        </div>
+                                    )}
+
+                                    <div style={{ color: "#888", marginTop: 8, fontSize: 12 }}>
+                                        Нужно для расчёта маршрута и выбора ближайшего курьера.
+                                    </div>
+                                </>
                             )}
 
-                            <div style={{ color: "#888", marginTop: 8, fontSize: 12 }}>
-                                Нужно для расчёта маршрута и выбора ближайшего курьера.
-                            </div>
+                            {showErrors && errors.pickupMissing && (
+                                <div style={{ color: "crimson", marginTop: 8, fontSize: 12 }}>
+                                    {errors.pickupMissing}
+                                </div>
+                            )}
                         </>
                     )}
                 </div>
@@ -615,46 +717,97 @@ export function NewOrderPage() {
                     <FieldError text={showErrors ? errors.customerPhone : undefined} />
                 </div>
 
-                {/* Delivery address */}
-                <div>
-                    <AddressAutocomplete
-                        placeholder="Delivery address (start typing...)"
-                        value={form.customerAddress}
+                {/* Delivery address (Google Places) + structured fields */}
+                <div style={{ padding: 12, border: "1px solid #333", borderRadius: 12 }}>
+                    <div style={{ fontSize: 12, color: "#aaa", marginBottom: 6 }}>
+                        Delivery address (Google Places)
+                    </div>
+
+                    <GooglePlacesAutocomplete
+                        placeholder="Delivery address — start typing..."
+                        value={form.dropoffAddressText}
                         onChangeText={onDropoffTextChange}
                         onPick={onDropoffPick}
                         disabled={loading}
+                        country="il"
                     />
-                    <FieldError text={showErrors ? errors.customerAddress : undefined} />
-                    <FieldError text={showErrors ? errors.customerAddressPick : undefined} />
-                    <Hint text="Важно: выбери адрес из подсказок — так мы получим координаты для навигатора курьера." />
-                </div>
 
-                {/* Delivery comment right under address */}
-                <div>
-          <textarea
-              placeholder="Delivery comment (домофон/подъезд/этаж/оставить у двери)"
-              value={form.notes}
-              onChange={(e) => update("notes", e.target.value)}
-              style={{
-                  width: "100%",
-                  padding: 10,
-                  borderRadius: 8,
-                  border: "1px solid #333",
-                  outline: "none",
-                  minHeight: 80,
-                  resize: "vertical",
-              }}
-          />
-                    <Hint text="Один комментарий только по доставке." />
+                    <FieldError text={showErrors ? errors.dropoffAddressText : undefined} />
+                    <FieldError text={showErrors ? errors.dropoffPick : undefined} />
+
+                    <Hint text="Важно: выбери адрес из подсказок Google — так мы получим координаты + placeId." />
+
+                    <div style={{ height: 10 }} />
+
+                    <div style={{ display: "flex", gap: 10 }}>
+                        <div style={{ flex: 1 }}>
+                            <input
+                                placeholder="Street"
+                                value={form.dropoffStreet}
+                                onChange={(e) => update("dropoffStreet", e.target.value)}
+                                style={inputStyle(showErrors && !!errors.dropoffStreet)}
+                            />
+                            <FieldError text={showErrors ? errors.dropoffStreet : undefined} />
+                        </div>
+
+                        <div style={{ width: 140 }}>
+                            <input
+                                placeholder="House #"
+                                value={form.dropoffHouseNumber}
+                                onChange={(e) => update("dropoffHouseNumber", e.target.value)}
+                                style={inputStyle(showErrors && !!errors.dropoffHouseNumber)}
+                            />
+                            <FieldError text={showErrors ? errors.dropoffHouseNumber : undefined} />
+                        </div>
+                    </div>
+
+                    <div style={{ height: 10 }} />
+
+                    <div style={{ display: "flex", gap: 10 }}>
+                        <div style={{ flex: 1 }}>
+                            <input
+                                placeholder="Apartment (optional)"
+                                value={form.dropoffApartment}
+                                onChange={(e) => update("dropoffApartment", e.target.value)}
+                                style={inputStyle(false)}
+                            />
+                        </div>
+
+                        <div style={{ flex: 1 }}>
+                            <input
+                                placeholder="Entrance (optional)"
+                                value={form.dropoffEntrance}
+                                onChange={(e) => update("dropoffEntrance", e.target.value)}
+                                style={inputStyle(false)}
+                            />
+                        </div>
+                    </div>
+
+                    <div style={{ height: 10 }} />
+
+                    {/* ✅ comment прямо под адресом */}
+                    <textarea
+                        placeholder="Delivery comment (домофон/подъезд/этаж/оставить у двери)"
+                        value={form.dropoffComment}
+                        onChange={(e) => update("dropoffComment", e.target.value)}
+                        style={{
+                            width: "100%",
+                            padding: 10,
+                            borderRadius: 8,
+                            border: "1px solid #333",
+                            outline: "none",
+                            minHeight: 80,
+                            resize: "vertical",
+                        }}
+                    />
+                    <Hint text="Комментарий относится ТОЛЬКО к доставке." />
                 </div>
 
                 <hr />
 
-                {/* Prep time (REQUIRED) */}
+                {/* Prep time */}
                 <div style={{ padding: 12, border: "1px solid #333", borderRadius: 12 }}>
-                    <div style={{ fontSize: 12, color: "#aaa", marginBottom: 8 }}>
-                        Order ready time (required)
-                    </div>
+                    <div style={{ fontSize: 12, color: "#aaa", marginBottom: 8 }}>Order ready time</div>
 
                     <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
                         {PREP_OPTIONS.map((m) => {
@@ -679,15 +832,9 @@ export function NewOrderPage() {
                         })}
                     </div>
 
-                    {prepTimeMin === null && !showErrors && (
-                        <div style={{ marginTop: 8, fontSize: 12, color: "#888" }}>
-                            Выбери время готовности, чтобы активировать “Create order”.
-                        </div>
-                    )}
-
                     <FieldError text={showErrors ? errors.prepTimeMin : undefined} />
 
-                    <div style={{ marginTop: 8, fontSize: 12, color: "#888" }}>
+                    <div style={{ marginTop: 10, fontSize: 12, color: "#888" }}>
                         Курьер увидит таймер “готово через …” в оффере и в активном заказе.
                     </div>
                 </div>
@@ -705,7 +852,6 @@ export function NewOrderPage() {
                             />
                             Cash
                         </label>
-
                         <label style={{ display: "flex", gap: 6, alignItems: "center" }}>
                             <input
                                 type="radio"
@@ -756,9 +902,7 @@ export function NewOrderPage() {
                     </div>
 
                     {quoteError && (
-                        <div style={{ marginTop: 8, color: "crimson", fontSize: 12 }}>
-                            {quoteError}
-                        </div>
+                        <div style={{ marginTop: 8, color: "crimson", fontSize: 12 }}>{quoteError}</div>
                     )}
 
                     <FieldError text={showErrors ? errors.quote : undefined} />
@@ -789,9 +933,7 @@ export function NewOrderPage() {
                             </>
                         ) : (
                             <>
-                                <div>
-                                    Курьер берет с клиента: <b>₪0.00</b>
-                                </div>
+                                <div>Курьер берет с клиента: <b>₪0.00</b></div>
                                 <div>
                                     Ресторан выдает курьеру (доставка):{" "}
                                     <b>₪{moneyFlow.courierGetsFromRestaurantAtPickup.toFixed(2)}</b>
@@ -802,13 +944,13 @@ export function NewOrderPage() {
                 </div>
 
                 <button
-                    disabled={!canSubmit}
+                    disabled={loading || quoteLoading || !canSubmit}
                     style={{
                         padding: 12,
                         borderRadius: 10,
                         border: "1px solid #333",
-                        cursor: !canSubmit ? "not-allowed" : "pointer",
-                        opacity: !canSubmit ? 0.7 : 1,
+                        cursor: loading || quoteLoading || !canSubmit ? "not-allowed" : "pointer",
+                        opacity: loading || quoteLoading || !canSubmit ? 0.7 : 1,
                     }}
                 >
                     {loading ? "Creating…" : "Create order"}
