@@ -52,14 +52,27 @@ type Offer = {
     prepTimeMin?: number;
     readyAtMs?: number;
 
+    // route / distance (server calculated)
     routeDistanceMeters?: number;
     routeDurationSeconds?: number;
+
+    // optional aliases (if order stores these)
+    deliveryDistanceMeters?: number;
+    deliveryDistanceKm?: number;
+
+    // structured dropoff fields (F)
+    dropoffStreet?: string;
+    dropoffHouseNumber?: string;
+    dropoffApartment?: string;
+    dropoffEntrance?: string;
+    dropoffComment?: string;
 };
 
 function shortId(id: string) {
     return (id || "").slice(0, 6).toUpperCase();
 }
 
+// Israel TZ keys for reports
 function israelDateKey(d = new Date()) {
     const parts = new Intl.DateTimeFormat("en-CA", {
         timeZone: "Asia/Jerusalem",
@@ -155,6 +168,44 @@ function readyInText(readyAtMs?: number, nowMs?: number) {
     const mm = Math.floor(totalSec / 60);
     const ss = totalSec % 60;
     return `${mm}:${String(ss).padStart(2, "0")}`;
+}
+
+function kmTextFromMeters(m?: number, digits = 1) {
+    if (typeof m !== "number" || !Number.isFinite(m) || m <= 0) return "—";
+    return `${(m / 1000).toFixed(digits)} km`;
+}
+
+function getPickupToDropoffMeters(x: any): number | null {
+    const a = x?.routeDistanceMeters;
+    if (typeof a === "number" && Number.isFinite(a) && a > 0) return a;
+
+    const b = x?.deliveryDistanceMeters;
+    if (typeof b === "number" && Number.isFinite(b) && b > 0) return b;
+
+    const km = x?.deliveryDistanceKm;
+    if (typeof km === "number" && Number.isFinite(km) && km > 0) return km * 1000;
+
+    return null;
+}
+
+function formatDropoff(o: any) {
+    const street = String(o?.dropoffStreet ?? "").trim();
+    const house = String(o?.dropoffHouseNumber ?? "").trim();
+    const apt = String(o?.dropoffApartment ?? "").trim();
+    const ent = String(o?.dropoffEntrance ?? "").trim();
+    const comment = String(o?.dropoffComment ?? o?.notes ?? "").trim();
+
+    const main =
+        [street, house].filter(Boolean).join(" ").trim() ||
+        String(o?.dropoffAddressText ?? o?.customerAddress ?? "").trim() ||
+        "—";
+
+    const extraParts: string[] = [];
+    if (apt) extraParts.push(`Apt ${apt}`);
+    if (ent) extraParts.push(`Entrance ${ent}`);
+    const extra = extraParts.join(", ");
+
+    return { main, extra, comment };
 }
 
 export default function CourierAppHome() {
@@ -364,7 +415,7 @@ export default function CourierAppHome() {
                         dropoffLat: data.dropoffLat,
                         dropoffLng: data.dropoffLng,
                         dropoffGeohash: data.dropoffGeohash,
-                        dropoffAddressText: data.dropoffAddressText,
+                        dropoffAddressText: data.dropoffAddressText ?? data.customerAddress ?? "",
 
                         pickupLat: data.pickupLat,
                         pickupLng: data.pickupLng,
@@ -385,6 +436,15 @@ export default function CourierAppHome() {
 
                         routeDistanceMeters: data.routeDistanceMeters,
                         routeDurationSeconds: data.routeDurationSeconds,
+
+                        deliveryDistanceMeters: data.deliveryDistanceMeters,
+                        deliveryDistanceKm: data.deliveryDistanceKm,
+
+                        dropoffStreet: data.dropoffStreet ?? "",
+                        dropoffHouseNumber: data.dropoffHouseNumber ?? "",
+                        dropoffApartment: data.dropoffApartment ?? "",
+                        dropoffEntrance: data.dropoffEntrance ?? "",
+                        dropoffComment: data.dropoffComment ?? data.notes ?? "",
                     };
                 });
 
@@ -463,8 +523,7 @@ export default function CourierAppHome() {
                     const lastAtMs = data.lastMessageAt?.toMillis?.() ?? 0;
                     const lastSenderId = String(data.lastMessageSenderId ?? "");
 
-                    const readAtMs =
-                        (data.lastReadAtCourier ?? data.courierLastReadAt)?.toMillis?.() ?? 0;
+                    const readAtMs = (data.lastReadAtCourier ?? data.courierLastReadAt)?.toMillis?.() ?? 0;
 
                     const isUnread = lastAtMs > readAtMs && lastSenderId && lastSenderId !== user.uid;
                     nextUnread[chatId] = !!isUnread;
@@ -629,6 +688,12 @@ export default function CourierAppHome() {
                 const orderSnap = await tx.get(orderRef);
                 if (!orderSnap.exists()) throw new Error("Order not found");
                 const orderData: any = orderSnap.data();
+
+                // ✅ safety: cannot take чужой заказ (под правила)
+                if (String(orderData.currentOfferCourierId ?? "") !== uid) {
+                    tx.update(offerRef, { status: "declined", updatedAt: serverTimestamp() });
+                    throw new Error("This order offer is not assigned to you");
+                }
 
                 if (orderData.status === "cancelled" || orderData.status === "delivered") {
                     tx.update(offerRef, { status: "declined", updatedAt: serverTimestamp() });
@@ -811,20 +876,25 @@ export default function CourierAppHome() {
                                     const canDeliver = st === "picked_up";
                                     const readyText = readyInText(ord?.readyAtMs, nowMs);
 
-                                    const code =
-                                        typeof ord?.shortCode === "string" && ord.shortCode
-                                            ? ord.shortCode
-                                            : shortId(ord.id);
+                                    const code = typeof ord?.shortCode === "string" && ord.shortCode ? ord.shortCode : shortId(ord.id);
 
-                                    const pickupMain =
-                                        wazeUrl(ord?.pickupLat, ord?.pickupLng) ??
-                                        googleMapsUrl(ord?.pickupLat, ord?.pickupLng);
+                                    const pickupMain = wazeUrl(ord?.pickupLat, ord?.pickupLng) ?? googleMapsUrl(ord?.pickupLat, ord?.pickupLng);
                                     const pickupYandex = yandexMapsUrl(ord?.pickupLat, ord?.pickupLng);
 
-                                    const dropoffMain =
-                                        wazeUrl(ord?.dropoffLat, ord?.dropoffLng) ??
-                                        googleMapsUrl(ord?.dropoffLat, ord?.dropoffLng);
+                                    const dropoffMain = wazeUrl(ord?.dropoffLat, ord?.dropoffLng) ?? googleMapsUrl(ord?.dropoffLat, ord?.dropoffLng);
                                     const dropoffYandex = yandexMapsUrl(ord?.dropoffLat, ord?.dropoffLng);
+
+                                    const courierLoc = lastGeoRef.current;
+                                    const courierToPickupM =
+                                        courierLoc && typeof ord?.pickupLat === "number" && typeof ord?.pickupLng === "number"
+                                            ? haversineMeters(courierLoc.lat, courierLoc.lng, ord.pickupLat, ord.pickupLng)
+                                            : null;
+
+                                    const pickupToDropoffM = getPickupToDropoffMeters(ord);
+
+                                    const totalTripM = (courierToPickupM ?? 0) + (pickupToDropoffM ?? 0);
+
+                                    const drop = formatDropoff(ord);
 
                                     const chatId = `${ord.id}_${user.uid}`;
                                     const hasUnread = !!unreadByChatId[chatId] && !chatOpenByOrderId[ord.id];
@@ -844,12 +914,8 @@ export default function CourierAppHome() {
                                                     </div>
 
                                                     <div className="row row--wrap">
-                            <span className={`pill ${st === "taken" ? "pill--warning" : "pill--success"}`}>
-                              1 · TAKEN
-                            </span>
-                                                        <span className={`pill ${st === "picked_up" ? "pill--info" : "pill--muted"}`}>
-                              2 · PICKED UP
-                            </span>
+                                                        <span className={`pill ${st === "taken" ? "pill--warning" : "pill--success"}`}>1 · TAKEN</span>
+                                                        <span className={`pill ${st === "picked_up" ? "pill--info" : "pill--muted"}`}>2 · PICKED UP</span>
                                                         <span className="pill pill--muted">3 · DELIVERED</span>
 
                                                         <span className={`pill ${readyText === "READY" ? "pill--success" : "pill--muted"}`}>
@@ -880,11 +946,29 @@ export default function CourierAppHome() {
                                                             </b>
                                                         </div>
 
+                                                        {/* Address structured + comment */}
                                                         <div className="line" style={{ alignItems: "baseline" }}>
                                                             <span>Address</span>
-                                                            <b style={{ textAlign: "right" }}>
-                                                                {ord.dropoffAddressText ?? ord.customerAddress ?? "—"}
-                                                            </b>
+                                                            <div style={{ textAlign: "right", fontWeight: 800 }}>
+                                                                <div>{drop.main}</div>
+                                                                {drop.extra && <div className="muted" style={{ fontWeight: 600 }}>{drop.extra}</div>}
+                                                                {drop.comment && <div className="muted" style={{ fontWeight: 600 }}>{drop.comment}</div>}
+                                                            </div>
+                                                        </div>
+
+                                                        <div className="line">
+                                                            <span>To restaurant</span>
+                                                            <b>{courierToPickupM ? kmTextFromMeters(courierToPickupM) : "—"}</b>
+                                                        </div>
+
+                                                        <div className="line">
+                                                            <span>Pickup → dropoff</span>
+                                                            <b>{pickupToDropoffM ? kmTextFromMeters(pickupToDropoffM) : "—"}</b>
+                                                        </div>
+
+                                                        <div className="line">
+                                                            <span>Total trip</span>
+                                                            <b>{courierToPickupM || pickupToDropoffM ? kmTextFromMeters(totalTripM) : "—"}</b>
                                                         </div>
 
                                                         <div className="line">
@@ -1017,9 +1101,7 @@ export default function CourierAppHome() {
                     Active {activeCount}/{MAX_ACTIVE_ORDERS}
                   </span>
 
-                                    {reachedMaxActive && (
-                                        <span className="pill pill--warning">Max {MAX_ACTIVE_ORDERS} active orders reached</span>
-                                    )}
+                                    {reachedMaxActive && <span className="pill pill--warning">Max {MAX_ACTIVE_ORDERS} active orders reached</span>}
                                 </div>
 
                                 <div className="hr" />
@@ -1028,16 +1110,25 @@ export default function CourierAppHome() {
 
                                 <div className="stack">
                                     {offers.map((o) => {
-                                        const pickupMain =
-                                            wazeUrl(o.pickupLat, o.pickupLng) ?? googleMapsUrl(o.pickupLat, o.pickupLng);
+                                        const pickupMain = wazeUrl(o.pickupLat, o.pickupLng) ?? googleMapsUrl(o.pickupLat, o.pickupLng);
                                         const pickupYandex = yandexMapsUrl(o.pickupLat, o.pickupLng);
 
                                         const isBusy = busyOfferId === o.id;
 
-                                        const offerCode =
-                                            typeof o.shortCode === "string" && o.shortCode ? o.shortCode : shortId(o.orderId);
+                                        const offerCode = typeof o.shortCode === "string" && o.shortCode ? o.shortCode : shortId(o.orderId);
 
                                         const readyText = readyInText(o.readyAtMs, nowMs);
+
+                                        const courierLoc = lastGeoRef.current;
+                                        const courierToPickupM =
+                                            courierLoc && typeof o?.pickupLat === "number" && typeof o?.pickupLng === "number"
+                                                ? haversineMeters(courierLoc.lat, courierLoc.lng, o.pickupLat, o.pickupLng)
+                                                : null;
+
+                                        const pickupToDropoffM = getPickupToDropoffMeters(o);
+                                        const totalTripM = (courierToPickupM ?? 0) + (pickupToDropoffM ?? 0);
+
+                                        const drop = formatDropoff(o);
 
                                         return (
                                             <div key={o.id} className="subcard">
@@ -1091,11 +1182,29 @@ export default function CourierAppHome() {
                                                         </b>
                                                     </div>
 
+                                                    {/* Address structured + comment */}
                                                     <div className="line" style={{ alignItems: "baseline" }}>
                                                         <span>Address</span>
-                                                        <b style={{ textAlign: "right" }}>
-                                                            {o.dropoffAddressText ?? o.customerAddress ?? "—"}
-                                                        </b>
+                                                        <div style={{ textAlign: "right", fontWeight: 800 }}>
+                                                            <div>{drop.main}</div>
+                                                            {drop.extra && <div className="muted" style={{ fontWeight: 600 }}>{drop.extra}</div>}
+                                                            {drop.comment && <div className="muted" style={{ fontWeight: 600 }}>{drop.comment}</div>}
+                                                        </div>
+                                                    </div>
+
+                                                    <div className="line">
+                                                        <span>To restaurant</span>
+                                                        <b>{courierToPickupM ? kmTextFromMeters(courierToPickupM) : "—"}</b>
+                                                    </div>
+
+                                                    <div className="line">
+                                                        <span>Pickup → dropoff</span>
+                                                        <b>{pickupToDropoffM ? kmTextFromMeters(pickupToDropoffM) : "—"}</b>
+                                                    </div>
+
+                                                    <div className="line">
+                                                        <span>Total trip</span>
+                                                        <b>{courierToPickupM || pickupToDropoffM ? kmTextFromMeters(totalTripM) : "—"}</b>
                                                     </div>
 
                                                     <div className="line">
@@ -1146,8 +1255,8 @@ export default function CourierAppHome() {
 
                                 <div className="stack">
                                     {completedOrders.map((o: any) => {
-                                        const code =
-                                            typeof o?.shortCode === "string" && o.shortCode ? o.shortCode : shortId(o.id);
+                                        const code = typeof o?.shortCode === "string" && o.shortCode ? o.shortCode : shortId(o.id);
+                                        const drop = formatDropoff(o);
 
                                         return (
                                             <div key={o.id} className="subcard">
@@ -1166,11 +1275,14 @@ export default function CourierAppHome() {
                                                         <b>{o.customerName ?? "—"}</b>
                                                     </div>
 
+                                                    {/* Address structured + comment */}
                                                     <div className="line" style={{ alignItems: "baseline" }}>
                                                         <span>Address</span>
-                                                        <b style={{ textAlign: "right" }}>
-                                                            {o.dropoffAddressText ?? o.customerAddress ?? "—"}
-                                                        </b>
+                                                        <div style={{ textAlign: "right", fontWeight: 800 }}>
+                                                            <div>{drop.main}</div>
+                                                            {drop.extra && <div className="muted" style={{ fontWeight: 600 }}>{drop.extra}</div>}
+                                                            {drop.comment && <div className="muted" style={{ fontWeight: 600 }}>{drop.comment}</div>}
+                                                        </div>
                                                     </div>
 
                                                     <div className="line">

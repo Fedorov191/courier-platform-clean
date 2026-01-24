@@ -59,6 +59,16 @@ type OrderDoc = {
     assignedCourierId?: string | null;
 
     createdAt?: Timestamp;
+
+
+
+    dropoffStreet?: string;
+    dropoffHouseNumber?: string;
+    dropoffApartment?: string;
+    dropoffEntrance?: string;
+    dropoffComment?: string;
+
+
 };
 
 function formatDate(ts?: Timestamp) {
@@ -101,6 +111,25 @@ function paymentTone(p: PaymentMethod) {
 function money(n: number) {
     const x = Number.isFinite(n) ? n : 0;
     return `₪${x.toFixed(2)}`;
+}
+function formatDropoff(o: any) {
+    const street = String(o?.dropoffStreet ?? "").trim();
+    const house = String(o?.dropoffHouseNumber ?? "").trim();
+    const apt = String(o?.dropoffApartment ?? "").trim();
+    const ent = String(o?.dropoffEntrance ?? "").trim();
+
+    const main = [street, house].filter(Boolean).join(" ")
+        || String(o?.dropoffAddressText ?? o?.customerAddress ?? "").trim()
+        || "—";
+
+    const extra = [
+        apt ? `Apt ${apt}` : "",
+        ent ? `Entrance ${ent}` : "",
+    ].filter(Boolean).join(", ");
+
+    const comment = String(o?.dropoffComment ?? o?.notes ?? "").trim();
+
+    return { main, extra, comment };
 }
 
 export function OrdersPage() {
@@ -222,7 +251,7 @@ export function OrdersPage() {
                         dropoffLat: data.dropoffLat,
                         dropoffLng: data.dropoffLng,
                         dropoffGeohash: data.dropoffGeohash,
-                        dropoffAddressText: data.dropoffAddressText,
+
 
                         triedCourierIds: Array.isArray(data.triedCourierIds) ? data.triedCourierIds : [],
 
@@ -244,6 +273,13 @@ export function OrdersPage() {
                         status: (data.status ?? "new") as OrderStatus,
                         assignedCourierId: (data.assignedCourierId ?? null) as string | null,
                         createdAt: data.createdAt,
+                        dropoffAddressText: data.dropoffAddressText ?? data.customerAddress ?? "",
+                        dropoffStreet: data.dropoffStreet ?? "",
+                        dropoffHouseNumber: data.dropoffHouseNumber ?? "",
+                        dropoffApartment: data.dropoffApartment ?? "",
+                        dropoffEntrance: data.dropoffEntrance ?? "",
+                        dropoffComment: data.dropoffComment ?? data.notes ?? "",
+
                     };
                 });
 
