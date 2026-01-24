@@ -16,6 +16,7 @@ import {
 
 import { auth, db } from "../lib/firebase";
 import { useNavigate } from "react-router-dom";
+import { useI18n } from "../lib/i18n";
 
 type OrderStatus = "new" | "offered" | "taken" | "picked_up" | "delivered" | "cancelled";
 type PaymentMethod = "cash" | "card";
@@ -60,48 +61,40 @@ type OrderDoc = {
 
     createdAt?: Timestamp;
 
-
-
+    // structured dropoff (F)
     dropoffStreet?: string;
     dropoffHouseNumber?: string;
     dropoffApartment?: string;
     dropoffEntrance?: string;
     dropoffComment?: string;
-
-
 };
 
-function formatDate(ts?: Timestamp) {
+function formatDate(ts?: Timestamp, locale?: string) {
     if (!ts) return "—";
-    return ts.toDate().toLocaleString();
-}
-
-function statusLabel(s: OrderStatus) {
-    switch (s) {
-        case "new": return "NEW";
-        case "offered": return "OFFERED";
-        case "taken": return "TAKEN";
-        case "picked_up": return "PICKED UP";
-        case "delivered": return "DELIVERED";
-        case "cancelled": return "CANCELLED";
-        default: return s;
+    try {
+        return ts.toDate().toLocaleString(locale || undefined);
+    } catch {
+        return ts.toDate().toLocaleString();
     }
 }
 
 function statusTone(s: OrderStatus) {
     switch (s) {
-        case "new": return "info";
-        case "offered": return "info";
-        case "taken": return "warning";
-        case "picked_up": return "info";
-        case "delivered": return "success";
-        case "cancelled": return "danger";
-        default: return "muted";
+        case "new":
+            return "info";
+        case "offered":
+            return "info";
+        case "taken":
+            return "warning";
+        case "picked_up":
+            return "info";
+        case "delivered":
+            return "success";
+        case "cancelled":
+            return "danger";
+        default:
+            return "muted";
     }
-}
-
-function paymentLabel(p: PaymentMethod) {
-    return p === "cash" ? "CASH" : "CARD";
 }
 
 function paymentTone(p: PaymentMethod) {
@@ -112,28 +105,10 @@ function money(n: number) {
     const x = Number.isFinite(n) ? n : 0;
     return `₪${x.toFixed(2)}`;
 }
-function formatDropoff(o: any) {
-    const street = String(o?.dropoffStreet ?? "").trim();
-    const house = String(o?.dropoffHouseNumber ?? "").trim();
-    const apt = String(o?.dropoffApartment ?? "").trim();
-    const ent = String(o?.dropoffEntrance ?? "").trim();
-
-    const main = [street, house].filter(Boolean).join(" ")
-        || String(o?.dropoffAddressText ?? o?.customerAddress ?? "").trim()
-        || "—";
-
-    const extra = [
-        apt ? `Apt ${apt}` : "",
-        ent ? `Entrance ${ent}` : "",
-    ].filter(Boolean).join(", ");
-
-    const comment = String(o?.dropoffComment ?? o?.notes ?? "").trim();
-
-    return { main, extra, comment };
-}
 
 export function OrdersPage() {
     const navigate = useNavigate();
+    const { t, lang } = useI18n();
 
     const [uid, setUid] = useState<string | null>(auth.currentUser?.uid ?? null);
     const [loading, setLoading] = useState(true);
@@ -211,6 +186,53 @@ export function OrdersPage() {
         return () => unsub();
     }, []);
 
+    // labels using t()
+    function statusLabel(s: OrderStatus) {
+        switch (s) {
+            case "new":
+                return t("statusNew");
+            case "offered":
+                return t("statusOffered");
+            case "taken":
+                return t("statusTaken");
+            case "picked_up":
+                return t("statusPickedUp");
+            case "delivered":
+                return t("statusDelivered");
+            case "cancelled":
+                return t("statusCancelled");
+            default:
+                return String(s || "—");
+        }
+    }
+
+    function paymentLabel(p: PaymentMethod) {
+        return p === "cash" ? t("paymentCash") : t("paymentCard");
+    }
+
+    function formatDropoff(o: any) {
+        const street = String(o?.dropoffStreet ?? "").trim();
+        const house = String(o?.dropoffHouseNumber ?? "").trim();
+        const apt = String(o?.dropoffApartment ?? "").trim();
+        const ent = String(o?.dropoffEntrance ?? "").trim();
+
+        const main =
+            [street, house].filter(Boolean).join(" ") ||
+            String(o?.dropoffAddressText ?? o?.customerAddress ?? "").trim() ||
+            "—";
+
+        const extra = [
+            apt ? `${t("addressApt")} ${apt}` : "",
+            ent ? `${t("addressEntrance")} ${ent}` : "",
+        ]
+            .filter(Boolean)
+            .join(", ");
+
+        const comment = String(o?.dropoffComment ?? o?.notes ?? "").trim();
+
+        return { main, extra, comment };
+    }
+
     // ✅ UI подписка на заказы ресторана
     useEffect(() => {
         setError("");
@@ -223,11 +245,7 @@ export function OrdersPage() {
 
         setLoading(true);
 
-        const q = query(
-            collection(db, "orders"),
-            where("restaurantId", "==", uid),
-            orderBy("createdAt", "desc")
-        );
+        const q = query(collection(db, "orders"), where("restaurantId", "==", uid), orderBy("createdAt", "desc"));
 
         const unsub = onSnapshot(
             q,
@@ -252,7 +270,6 @@ export function OrdersPage() {
                         dropoffLng: data.dropoffLng,
                         dropoffGeohash: data.dropoffGeohash,
 
-
                         triedCourierIds: Array.isArray(data.triedCourierIds) ? data.triedCourierIds : [],
 
                         customerName: data.customerName ?? "",
@@ -273,13 +290,14 @@ export function OrdersPage() {
                         status: (data.status ?? "new") as OrderStatus,
                         assignedCourierId: (data.assignedCourierId ?? null) as string | null,
                         createdAt: data.createdAt,
+
+                        // structured dropoff (F)
                         dropoffAddressText: data.dropoffAddressText ?? data.customerAddress ?? "",
                         dropoffStreet: data.dropoffStreet ?? "",
                         dropoffHouseNumber: data.dropoffHouseNumber ?? "",
                         dropoffApartment: data.dropoffApartment ?? "",
                         dropoffEntrance: data.dropoffEntrance ?? "",
                         dropoffComment: data.dropoffComment ?? data.notes ?? "",
-
                     };
                 });
 
@@ -287,13 +305,13 @@ export function OrdersPage() {
                 setLoading(false);
             },
             (e) => {
-                setError(e.message ?? "Firestore error");
+                setError(e?.message ?? t("errorFirestore"));
                 setLoading(false);
             }
         );
 
         return () => unsub();
-    }, [uid]);
+    }, [uid, t]);
 
     const markChatRead = useCallback(async (chatId: string) => {
         try {
@@ -327,8 +345,7 @@ export function OrdersPage() {
                     const lastAtMs = data.lastMessageAt?.toMillis?.() ?? 0;
                     const lastSenderId = String(data.lastMessageSenderId ?? "");
 
-                    const readAtMs =
-                        (data.restaurantLastReadAt ?? data.lastReadAtRestaurant)?.toMillis?.() ?? 0;
+                    const readAtMs = (data.restaurantLastReadAt ?? data.lastReadAtRestaurant)?.toMillis?.() ?? 0;
 
                     const isUnread = lastAtMs > readAtMs && lastSenderId && lastSenderId !== uid;
                     nextUnread[chatId] = !!isUnread;
@@ -377,13 +394,7 @@ export function OrdersPage() {
 
     const filteredOrders = useMemo(() => {
         if (tab === "active") {
-            return orders.filter(
-                (o) =>
-                    o.status === "new" ||
-                    o.status === "offered" ||
-                    o.status === "taken" ||
-                    o.status === "picked_up"
-            );
+            return orders.filter((o) => o.status === "new" || o.status === "offered" || o.status === "taken" || o.status === "picked_up");
         }
         if (tab === "completed") {
             return orders.filter((o) => o.status === "delivered");
@@ -407,7 +418,7 @@ export function OrdersPage() {
     const goNewOrder = () => navigate("/restaurant/app/orders/new");
 
     async function cancelOrder(orderId: string) {
-        if (!window.confirm("Cancel this order?")) return;
+        if (!window.confirm(t("confirmCancelOrder"))) return;
 
         setBusyAction(`cancel:${orderId}`);
         try {
@@ -417,7 +428,7 @@ export function OrdersPage() {
                 updatedAt: serverTimestamp(),
             });
         } catch (e: any) {
-            setError(e?.message ?? "Failed to cancel order");
+            setError(e?.message ?? t("errorCancelOrder"));
         } finally {
             setBusyAction(null);
         }
@@ -425,7 +436,7 @@ export function OrdersPage() {
 
     async function removeCourier(orderId: string, assignedCourierId?: string | null) {
         if (!assignedCourierId) return;
-        if (!window.confirm("Remove courier from this order and reassign?")) return;
+        if (!window.confirm(t("confirmRemoveCourier"))) return;
 
         setBusyAction(`remove:${orderId}`);
         try {
@@ -435,7 +446,7 @@ export function OrdersPage() {
                 updatedAt: serverTimestamp(),
             });
         } catch (e: any) {
-            setError(e?.message ?? "Failed to remove courier");
+            setError(e?.message ?? t("errorRemoveCourier"));
         } finally {
             setBusyAction(null);
         }
@@ -445,9 +456,9 @@ export function OrdersPage() {
         return (
             <div className="card">
                 <div className="card__inner">
-                    <h2 style={{ margin: 0 }}>Orders</h2>
+                    <h2 style={{ margin: 0 }}>{t("orders")}</h2>
                     <div className="alert alert--danger" style={{ marginTop: 12 }}>
-                        No auth session. Please login.
+                        {t("noAuthSession")}
                     </div>
                 </div>
             </div>
@@ -458,50 +469,49 @@ export function OrdersPage() {
         <div className="stack">
             <div className="row row--between row--wrap row--mobile-stack">
                 <div>
-                    <h2 style={{ margin: 0 }}>Orders</h2>
+                    <h2 style={{ margin: 0 }}>{t("orders")}</h2>
 
                     <div className="row row--wrap" style={{ marginTop: 8 }}>
                         <div className="row row--wrap" style={{ marginTop: 10 }}>
-                            <button
-                                className={`btn ${tab === "active" ? "btn--primary" : "btn--ghost"}`}
-                                onClick={() => setTab("active")}
-                            >
-                                Active ({counts.active})
+                            <button className={`btn ${tab === "active" ? "btn--primary" : "btn--ghost"}`} onClick={() => setTab("active")}>
+                                {t("tabActive")} ({counts.active})
                             </button>
 
-                            <button
-                                className={`btn ${tab === "completed" ? "btn--primary" : "btn--ghost"}`}
-                                onClick={() => setTab("completed")}
-                            >
-                                Completed ({counts.completed})
+                            <button className={`btn ${tab === "completed" ? "btn--primary" : "btn--ghost"}`} onClick={() => setTab("completed")}>
+                                {t("tabCompleted")} ({counts.completed})
                             </button>
 
-                            <button
-                                className={`btn ${tab === "cancelled" ? "btn--primary" : "btn--ghost"}`}
-                                onClick={() => setTab("cancelled")}
-                            >
-                                Cancelled ({counts.cancelled})
+                            <button className={`btn ${tab === "cancelled" ? "btn--primary" : "btn--ghost"}`} onClick={() => setTab("cancelled")}>
+                                {t("tabCancelled")} ({counts.cancelled})
                             </button>
                         </div>
 
-                        <span className="pill pill--muted">Total {stats.total}</span>
-                        <span className="pill pill--info">NEW {stats.byStatus.new ?? 0}</span>
-                        <span className="pill pill--warning">TAKEN {stats.byStatus.taken ?? 0}</span>
-                        <span className="pill pill--success">DELIVERED {stats.byStatus.delivered ?? 0}</span>
+                        <span className="pill pill--muted">
+              {t("total")} {stats.total}
+            </span>
+                        <span className="pill pill--info">
+              {statusLabel("new")} {stats.byStatus.new ?? 0}
+            </span>
+                        <span className="pill pill--warning">
+              {statusLabel("taken")} {stats.byStatus.taken ?? 0}
+            </span>
+                        <span className="pill pill--success">
+              {statusLabel("delivered")} {stats.byStatus.delivered ?? 0}
+            </span>
                     </div>
                 </div>
 
                 <button className="btn btn--primary" onClick={goNewOrder}>
-                    + New order
+                    + {t("newOrder")}
                 </button>
             </div>
 
-            {loading && <div className="muted">Loading…</div>}
+            {loading && <div className="muted">{t("loading")}</div>}
             {error && <div className="alert alert--danger">{error}</div>}
 
             {!loading && !error && orders.length === 0 && (
                 <div className="muted">
-                    No orders yet. Click <b>+ New order</b>.
+                    {t("noOrdersYet")} <b>+ {t("newOrder")}</b>.
                 </div>
             )}
 
@@ -511,25 +521,21 @@ export function OrdersPage() {
                     const chatId = o.assignedCourierId ? `${o.id}_${o.assignedCourierId}` : null;
 
                     const code =
-                        typeof (o as any).shortCode === "string" && (o as any).shortCode
-                            ? (o as any).shortCode
-                            : o.id.slice(0, 6).toUpperCase();
+                        typeof (o as any).shortCode === "string" && (o as any).shortCode ? (o as any).shortCode : o.id.slice(0, 6).toUpperCase();
+
+                    const drop = formatDropoff(o);
 
                     return (
                         <div key={o.id} className="card">
                             <div className="card__inner">
                                 <div className="row row--between row--wrap">
                                     <div style={{ fontWeight: 950 }}>
-                                        Order <span className="mono">#{code}</span>
+                                        {t("order")} <span className="mono">#{code}</span>
                                     </div>
 
                                     <div className="row row--wrap">
-                    <span className={`pill pill--${paymentTone(o.paymentType)}`}>
-                      {paymentLabel(o.paymentType)}
-                    </span>
-                                        <span className={`pill pill--${statusTone(o.status)}`}>
-                      {statusLabel(o.status)}
-                    </span>
+                                        <span className={`pill pill--${paymentTone(o.paymentType)}`}>{paymentLabel(o.paymentType)}</span>
+                                        <span className={`pill pill--${statusTone(o.status)}`}>{statusLabel(o.status)}</span>
                                     </div>
                                 </div>
 
@@ -538,36 +544,43 @@ export function OrdersPage() {
                                 <div className="subcard">
                                     <div className="kv">
                                         <div className="line">
-                                            <span>Customer</span>
+                                            <span>{t("fieldCustomer")}</span>
                                             <b>{o.customerName || "—"}</b>
                                         </div>
 
+                                        {/* ✅ structured address + comment */}
                                         <div className="line" style={{ alignItems: "baseline" }}>
-                                            <span>Address</span>
-                                            <b style={{ textAlign: "right" }}>
-                                                {o.dropoffAddressText ?? o.customerAddress ?? "—"}
-                                            </b>
+                                            <span>{t("fieldAddress")}</span>
+                                            <div style={{ textAlign: "right", fontWeight: 800 }}>
+                                                <div>{drop.main}</div>
+                                                {drop.extra && <div className="muted" style={{ fontWeight: 600 }}>{drop.extra}</div>}
+                                                {drop.comment && (
+                                                    <div className="muted" style={{ fontWeight: 600 }}>
+                                                        {t("comment")}: {drop.comment}
+                                                    </div>
+                                                )}
+                                            </div>
                                         </div>
 
                                         {o.customerPhone && (
                                             <div className="line">
-                                                <span>Phone</span>
+                                                <span>{t("fieldPhone")}</span>
                                                 <b>{o.customerPhone}</b>
                                             </div>
                                         )}
 
                                         <div className="line">
-                                            <span>Subtotal</span>
+                                            <span>{t("fieldSubtotal")}</span>
                                             <b>{money(o.orderSubtotal)}</b>
                                         </div>
 
                                         <div className="line">
-                                            <span>Delivery fee</span>
+                                            <span>{t("fieldDeliveryFee")}</span>
                                             <b>{money(o.deliveryFee)}</b>
                                         </div>
 
                                         <div className="line">
-                                            <span>Total</span>
+                                            <span>{t("fieldTotal")}</span>
                                             <b>{money(o.orderTotal)}</b>
                                         </div>
 
@@ -576,22 +589,22 @@ export function OrdersPage() {
                                         {isCash ? (
                                             <>
                                                 <div className="line">
-                                                    <span>Courier pays restaurant</span>
+                                                    <span>{t("cashCourierPaysRestaurant")}</span>
                                                     <b>{money(o.courierPaysAtPickup)}</b>
                                                 </div>
                                                 <div className="line">
-                                                    <span>Courier collects from customer</span>
+                                                    <span>{t("cashCourierCollectsFromCustomer")}</span>
                                                     <b>{money(o.courierCollectsFromCustomer)}</b>
                                                 </div>
                                             </>
                                         ) : (
                                             <>
                                                 <div className="line">
-                                                    <span>Courier collects from customer</span>
+                                                    <span>{t("cashCourierCollectsFromCustomer")}</span>
                                                     <b>₪0.00</b>
                                                 </div>
                                                 <div className="line">
-                                                    <span>Restaurant pays courier</span>
+                                                    <span>{t("cardRestaurantPaysCourier")}</span>
                                                     <b>{money(o.courierGetsFromRestaurantAtPickup)}</b>
                                                 </div>
                                             </>
@@ -602,22 +615,14 @@ export function OrdersPage() {
                                 {tab === "active" && (
                                     <div className="row row--wrap row--mobile-stack" style={{ marginTop: 12 }}>
                                         {o.status !== "delivered" && o.status !== "cancelled" && (
-                                            <button
-                                                className="btn btn--danger"
-                                                onClick={() => cancelOrder(o.id)}
-                                                disabled={busyAction === `cancel:${o.id}`}
-                                            >
-                                                {busyAction === `cancel:${o.id}` ? "Cancelling…" : "Cancel order"}
+                                            <button className="btn btn--danger" onClick={() => cancelOrder(o.id)} disabled={busyAction === `cancel:${o.id}`}>
+                                                {busyAction === `cancel:${o.id}` ? t("cancelling") : t("cancelOrder")}
                                             </button>
                                         )}
 
                                         {o.status === "taken" && o.assignedCourierId && (
-                                            <button
-                                                className="btn"
-                                                onClick={() => removeCourier(o.id, o.assignedCourierId)}
-                                                disabled={busyAction === `remove:${o.id}`}
-                                            >
-                                                {busyAction === `remove:${o.id}` ? "Removing…" : "Remove courier"}
+                                            <button className="btn" onClick={() => removeCourier(o.id, o.assignedCourierId)} disabled={busyAction === `remove:${o.id}`}>
+                                                {busyAction === `remove:${o.id}` ? t("removing") : t("removeCourier")}
                                             </button>
                                         )}
 
@@ -631,7 +636,7 @@ export function OrdersPage() {
                                                     if (willOpen) markChatRead(chatId);
                                                 }}
                                             >
-                                                {chatOpenByOrderId[o.id] ? "Hide chat" : "Chat"}
+                                                {chatOpenByOrderId[o.id] ? t("hideChat") : t("chat")}
 
                                                 {!!unreadByChatId[chatId] && !chatOpenByOrderId[o.id] && (
                                                     <span
@@ -661,14 +666,14 @@ export function OrdersPage() {
 
                                         {o.assignedCourierId && (
                                             <span className="pill pill--muted">
-                        Courier: {(o.assignedCourierId || "").slice(0, 6).toUpperCase()}
+                        {t("courier")}: {(o.assignedCourierId || "").slice(0, 6).toUpperCase()}
                       </span>
                                         )}
                                     </div>
                                 )}
 
                                 <div className="muted" style={{ marginTop: 10, fontSize: 12 }}>
-                                    Created: <b>{formatDate(o.createdAt)}</b>
+                                    {t("created")}: <b>{formatDate(o.createdAt, lang)}</b>
                                 </div>
                             </div>
                         </div>

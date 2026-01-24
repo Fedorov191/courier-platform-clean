@@ -16,6 +16,7 @@ import {
 import { signOut } from "firebase/auth";
 import { useNavigate } from "react-router-dom";
 import { geohashForLocation } from "geofire-common";
+import { useI18n } from "../lib/i18n";
 
 type Offer = {
     id: string;
@@ -145,21 +146,6 @@ function pillToneForOrderStatus(status?: string) {
     }
 }
 
-function labelForOrderStatus(status?: string) {
-    switch (status) {
-        case "taken":
-            return "TAKEN";
-        case "picked_up":
-            return "PICKED UP";
-        case "delivered":
-            return "DELIVERED";
-        case "new":
-            return "NEW";
-        default:
-            return (status || "—").toUpperCase();
-    }
-}
-
 function readyInText(readyAtMs?: number, nowMs?: number) {
     if (typeof readyAtMs !== "number" || !Number.isFinite(readyAtMs)) return "—";
     const diff = readyAtMs - (typeof nowMs === "number" ? nowMs : Date.now());
@@ -188,7 +174,8 @@ function getPickupToDropoffMeters(x: any): number | null {
     return null;
 }
 
-function formatDropoff(o: any) {
+// Возвращаем “части”, а не готовые “Apt/Entrance” (чтобы локализовать в UI)
+function formatDropoffParts(o: any) {
     const street = String(o?.dropoffStreet ?? "").trim();
     const house = String(o?.dropoffHouseNumber ?? "").trim();
     const apt = String(o?.dropoffApartment ?? "").trim();
@@ -200,17 +187,13 @@ function formatDropoff(o: any) {
         String(o?.dropoffAddressText ?? o?.customerAddress ?? "").trim() ||
         "—";
 
-    const extraParts: string[] = [];
-    if (apt) extraParts.push(`Apt ${apt}`);
-    if (ent) extraParts.push(`Entrance ${ent}`);
-    const extra = extraParts.join(", ");
-
-    return { main, extra, comment };
+    return { main, apt, ent, comment };
 }
 
 export default function CourierAppHome() {
     const nav = useNavigate();
     const user = auth.currentUser;
+    const { t } = useI18n();
 
     const watchId = useRef<number | null>(null);
     const heartbeatId = useRef<number | null>(null);
@@ -260,6 +243,36 @@ export default function CourierAppHome() {
 
     function toggleChat(orderId: string) {
         setChatOpenByOrderId((prev) => ({ ...prev, [orderId]: !prev[orderId] }));
+    }
+
+    function statusLabel(status?: string) {
+        switch (status) {
+            case "new":
+                return t("courierStatusNew");
+            case "taken":
+                return t("courierStatusTaken");
+            case "picked_up":
+                return t("courierStatusPickedUp");
+            case "delivered":
+                return t("courierStatusDelivered");
+            case "cancelled":
+                return t("courierStatusCancelled");
+            default:
+                return (status || "—").toUpperCase();
+        }
+    }
+
+    function paymentLabel(pt?: string) {
+        if (pt === "cash") return t("courierPaymentCash");
+        if (pt === "card") return t("courierPaymentCard");
+        return "—";
+    }
+
+    function dropoffExtra(apt?: string, ent?: string) {
+        const parts: string[] = [];
+        if (apt) parts.push(`${t("courierAptShort")} ${apt}`);
+        if (ent) parts.push(`${t("courierEntranceShort")} ${ent}`);
+        return parts.join(", ");
     }
 
     // =======================
@@ -372,9 +385,13 @@ export default function CourierAppHome() {
 
             try {
                 await setDoc(courierPrivateRef, { updatedAt: serverTimestamp() }, { merge: true });
-                await setDoc(courierPublicRef, { courierId: user.uid, updatedAt: serverTimestamp() }, { merge: true });
+                await setDoc(
+                    courierPublicRef,
+                    { courierId: user.uid, updatedAt: serverTimestamp() },
+                    { merge: true }
+                );
             } catch (e: any) {
-                if (!cancelled) setErr(e?.message ?? "Failed to init courier docs");
+                if (!cancelled) setErr(e?.message ?? t("courierErrorInitDocs"));
             }
         }
 
@@ -382,7 +399,7 @@ export default function CourierAppHome() {
         return () => {
             cancelled = true;
         };
-    }, [user, courierPrivateRef, courierPublicRef]);
+    }, [user, courierPrivateRef, courierPublicRef, t]);
 
     // subscribe offers
     useEffect(() => {
@@ -450,11 +467,11 @@ export default function CourierAppHome() {
 
                 setOffers(list.slice(0, MAX_PENDING_OFFERS));
             },
-            (e: any) => setErr(e?.message ?? "Failed to load offers")
+            (e: any) => setErr(e?.message ?? t("courierErrorLoadOffers"))
         );
 
         return () => unsub();
-    }, [user]);
+    }, [user, t]);
 
     // active orders
     useEffect(() => {
@@ -469,11 +486,11 @@ export default function CourierAppHome() {
         const unsub = onSnapshot(
             qActive,
             (snap) => setActiveOrders(snap.docs.map((d) => ({ id: d.id, ...d.data() }))),
-            (e: any) => setErr(e?.message ?? "Failed to load active orders")
+            (e: any) => setErr(e?.message ?? t("courierErrorLoadActiveOrders"))
         );
 
         return () => unsub();
-    }, [user]);
+    }, [user, t]);
 
     // completed orders
     useEffect(() => {
@@ -496,11 +513,11 @@ export default function CourierAppHome() {
                 });
                 setCompletedOrders(list);
             },
-            (e: any) => setErr(e?.message ?? "Failed to load completed orders")
+            (e: any) => setErr(e?.message ?? t("courierErrorLoadCompletedOrders"))
         );
 
         return () => unsub();
-    }, [user]);
+    }, [user, t]);
 
     // chats (courier) => unread + beep
     useEffect(() => {
@@ -523,7 +540,8 @@ export default function CourierAppHome() {
                     const lastAtMs = data.lastMessageAt?.toMillis?.() ?? 0;
                     const lastSenderId = String(data.lastMessageSenderId ?? "");
 
-                    const readAtMs = (data.lastReadAtCourier ?? data.courierLastReadAt)?.toMillis?.() ?? 0;
+                    const readAtMs =
+                        (data.lastReadAtCourier ?? data.courierLastReadAt)?.toMillis?.() ?? 0;
 
                     const isUnread = lastAtMs > readAtMs && lastSenderId && lastSenderId !== user.uid;
                     nextUnread[chatId] = !!isUnread;
@@ -566,7 +584,7 @@ export default function CourierAppHome() {
         setErr(null);
 
         if (!next && activeOrders.length > 0) {
-            setErr("You can't go OFFLINE while you have active orders.");
+            setErr(t("courierErrorCannotOfflineActive"));
             return;
         }
 
@@ -588,21 +606,26 @@ export default function CourierAppHome() {
 
             await setDoc(
                 courierPublicRef,
-                { courierId: user.uid, isOnline: next, lastSeenAt: serverTimestamp(), updatedAt: serverTimestamp() },
+                {
+                    courierId: user.uid,
+                    isOnline: next,
+                    lastSeenAt: serverTimestamp(),
+                    updatedAt: serverTimestamp(),
+                },
                 { merge: true }
             );
 
             setIsOnline(next);
             if (next) startTracking();
         } catch (e: any) {
-            setErr(e?.message ?? "Failed to update status");
+            setErr(e?.message ?? t("courierErrorUpdateStatus"));
         }
     }
 
     function startTracking() {
         if (!courierPublicRef) return;
         if (!navigator.geolocation) {
-            setErr("Geolocation not supported");
+            setErr(t("courierErrorGeoNotSupported"));
             return;
         }
 
@@ -624,7 +647,13 @@ export default function CourierAppHome() {
 
                 await setDoc(
                     courierPublicRef,
-                    { lat: last.lat, lng: last.lng, geohash, lastSeenAt: serverTimestamp(), updatedAt: serverTimestamp() },
+                    {
+                        lat: last.lat,
+                        lng: last.lng,
+                        geohash,
+                        lastSeenAt: serverTimestamp(),
+                        updatedAt: serverTimestamp(),
+                    },
                     { merge: true }
                 );
 
@@ -657,13 +686,19 @@ export default function CourierAppHome() {
 
                     await setDoc(
                         courierPublicRef,
-                        { lat: latitude, lng: longitude, geohash, lastSeenAt: serverTimestamp(), updatedAt: serverTimestamp() },
+                        {
+                            lat: latitude,
+                            lng: longitude,
+                            geohash,
+                            lastSeenAt: serverTimestamp(),
+                            updatedAt: serverTimestamp(),
+                        },
                         { merge: true }
                     );
 
                     lastGeoWriteMsRef.current = now;
                 } catch (e: any) {
-                    setErr(e?.message ?? "Failed to update location");
+                    setErr(e?.message ?? t("courierErrorUpdateLocation"));
                 } finally {
                     geoWriteInFlightRef.current = false;
                 }
@@ -686,23 +721,23 @@ export default function CourierAppHome() {
         try {
             await runTransaction(db, async (tx) => {
                 const orderSnap = await tx.get(orderRef);
-                if (!orderSnap.exists()) throw new Error("Order not found");
+                if (!orderSnap.exists()) throw new Error(t("courierErrorOrderNotFound"));
                 const orderData: any = orderSnap.data();
 
-                // ✅ safety: cannot take чужой заказ (под правила)
+                // safety: cannot take чужой заказ
                 if (String(orderData.currentOfferCourierId ?? "") !== uid) {
                     tx.update(offerRef, { status: "declined", updatedAt: serverTimestamp() });
-                    throw new Error("This order offer is not assigned to you");
+                    throw new Error(t("courierErrorOfferNotForYou"));
                 }
 
                 if (orderData.status === "cancelled" || orderData.status === "delivered") {
                     tx.update(offerRef, { status: "declined", updatedAt: serverTimestamp() });
-                    throw new Error("Order is no longer available");
+                    throw new Error(t("courierErrorOrderNotAvailable"));
                 }
 
                 if (orderData.assignedCourierId && orderData.assignedCourierId !== uid) {
                     tx.update(offerRef, { status: "declined", updatedAt: serverTimestamp() });
-                    throw new Error("Order already taken by another courier");
+                    throw new Error(t("courierErrorOrderTaken"));
                 }
 
                 if (!orderData.assignedCourierId) {
@@ -717,7 +752,7 @@ export default function CourierAppHome() {
                 tx.update(offerRef, { status: "accepted", updatedAt: serverTimestamp() });
             });
         } catch (e: any) {
-            setErr(e?.message ?? "Failed to accept offer");
+            setErr(e?.message ?? t("courierErrorAcceptOffer"));
         } finally {
             setBusyOfferId(null);
         }
@@ -769,7 +804,7 @@ export default function CourierAppHome() {
 
     async function logout() {
         if (activeOrders.length > 0) {
-            setErr("You can't logout while you have active orders. Finish delivery or ask restaurant to remove you.");
+            setErr(t("courierErrorLogoutActive"));
             return;
         }
 
@@ -783,7 +818,11 @@ export default function CourierAppHome() {
     if (!user) {
         return (
             <div className="page">
-                <div className="container container--mid">Not authorized</div>
+                <div className="container container--mid">
+                    <div className="card">
+                        <div className="card__inner">{t("courierNotAuthorized")}</div>
+                    </div>
+                </div>
             </div>
         );
     }
@@ -801,16 +840,16 @@ export default function CourierAppHome() {
                         <div className="row row--between row--wrap row--mobile-stack">
                             <div>
                                 <div className="brand" style={{ fontSize: 22 }}>
-                                    Courier Console
+                                    {t("courierConsoleTitle")}
                                 </div>
                                 <div className="muted" style={{ marginTop: 6 }}>
-                                    Your work dashboard — offers, active orders, delivery steps.
+                                    {t("courierConsoleSubtitle")}
                                 </div>
                             </div>
 
                             <div className="row row--wrap row--mobile-stack" style={{ justifyContent: "flex-end" }}>
                 <span className={`pill ${isOnline ? "pill--success" : "pill--muted"}`}>
-                  {isOnline ? "● ONLINE" : "● OFFLINE"}
+                  {isOnline ? `● ${t("courierOnline")}` : `● ${t("courierOffline")}`}
                 </span>
 
                                 <button
@@ -821,19 +860,19 @@ export default function CourierAppHome() {
                                     }}
                                     disabled={isOnline}
                                 >
-                                    Go online
+                                    {t("courierGoOnline")}
                                 </button>
 
                                 <button className="btn" onClick={() => setOnline(false)} disabled={!isOnline || hasActive}>
-                                    Go offline
+                                    {t("courierGoOffline")}
                                 </button>
 
                                 <button className="btn btn--ghost" onClick={() => nav("/courier/app/reports")}>
-                                    Reports
+                                    {t("reports")}
                                 </button>
 
                                 <button className="btn btn--ghost" onClick={logout} disabled={hasActive}>
-                                    Logout
+                                    {t("logout")}
                                 </button>
                             </div>
                         </div>
@@ -851,12 +890,19 @@ export default function CourierAppHome() {
                 <div className="card">
                     <div className="card__inner">
                         <div className="row row--wrap">
-                            <button className={`btn ${tab === "active" ? "btn--primary" : "btn--ghost"}`} onClick={() => setTab("active")}>
-                                Активные
+                            <button
+                                className={`btn ${tab === "active" ? "btn--primary" : "btn--ghost"}`}
+                                onClick={() => setTab("active")}
+                            >
+                                {t("courierActiveTab")}
                             </button>
 
-                            <button className={`btn ${tab === "completed" ? "btn--primary" : "btn--ghost"}`} onClick={() => setTab("completed")}>
-                                Выполненные <span className="pill pill--muted">{completedOrders.length}</span>
+                            <button
+                                className={`btn ${tab === "completed" ? "btn--primary" : "btn--ghost"}`}
+                                onClick={() => setTab("completed")}
+                            >
+                                {t("courierCompletedTab")}{" "}
+                                <span className="pill pill--muted">{completedOrders.length}</span>
                             </button>
                         </div>
                     </div>
@@ -875,13 +921,24 @@ export default function CourierAppHome() {
                                     const canPickup = st === "taken";
                                     const canDeliver = st === "picked_up";
                                     const readyText = readyInText(ord?.readyAtMs, nowMs);
+                                    const readyPill =
+                                        readyText === "READY"
+                                            ? t("courierReadyNow")
+                                            : `${t("courierReadyInLabel")} ${readyText}`;
 
-                                    const code = typeof ord?.shortCode === "string" && ord.shortCode ? ord.shortCode : shortId(ord.id);
+                                    const code =
+                                        typeof ord?.shortCode === "string" && ord.shortCode
+                                            ? ord.shortCode
+                                            : shortId(ord.id);
 
-                                    const pickupMain = wazeUrl(ord?.pickupLat, ord?.pickupLng) ?? googleMapsUrl(ord?.pickupLat, ord?.pickupLng);
+                                    const pickupMain =
+                                        wazeUrl(ord?.pickupLat, ord?.pickupLng) ??
+                                        googleMapsUrl(ord?.pickupLat, ord?.pickupLng);
                                     const pickupYandex = yandexMapsUrl(ord?.pickupLat, ord?.pickupLng);
 
-                                    const dropoffMain = wazeUrl(ord?.dropoffLat, ord?.dropoffLng) ?? googleMapsUrl(ord?.dropoffLat, ord?.dropoffLng);
+                                    const dropoffMain =
+                                        wazeUrl(ord?.dropoffLat, ord?.dropoffLng) ??
+                                        googleMapsUrl(ord?.dropoffLat, ord?.dropoffLng);
                                     const dropoffYandex = yandexMapsUrl(ord?.dropoffLat, ord?.dropoffLng);
 
                                     const courierLoc = lastGeoRef.current;
@@ -891,10 +948,10 @@ export default function CourierAppHome() {
                                             : null;
 
                                     const pickupToDropoffM = getPickupToDropoffMeters(ord);
-
                                     const totalTripM = (courierToPickupM ?? 0) + (pickupToDropoffM ?? 0);
 
-                                    const drop = formatDropoff(ord);
+                                    const drop = formatDropoffParts(ord);
+                                    const extra = dropoffExtra(drop.apt, drop.ent);
 
                                     const chatId = `${ord.id}_${user.uid}`;
                                     const hasUnread = !!unreadByChatId[chatId] && !chatOpenByOrderId[ord.id];
@@ -905,21 +962,26 @@ export default function CourierAppHome() {
                                                 <div className="row row--between row--wrap">
                                                     <div className="row row--wrap">
                                                         <div style={{ fontWeight: 950, fontSize: 16 }}>
-                                                            Active order <span className="mono">#{code}</span>
+                                                            {t("courierActiveOrderTitle")}{" "}
+                                                            <span className="mono">#{code}</span>
                                                         </div>
 
                                                         <span className={`pill pill--${pillToneForOrderStatus(ord.status)}`}>
-                              {labelForOrderStatus(ord.status)}
+                              {statusLabel(ord.status)}
                             </span>
                                                     </div>
 
                                                     <div className="row row--wrap">
-                                                        <span className={`pill ${st === "taken" ? "pill--warning" : "pill--success"}`}>1 · TAKEN</span>
-                                                        <span className={`pill ${st === "picked_up" ? "pill--info" : "pill--muted"}`}>2 · PICKED UP</span>
-                                                        <span className="pill pill--muted">3 · DELIVERED</span>
+                            <span className={`pill ${st === "taken" ? "pill--warning" : "pill--success"}`}>
+                              1 · {t("courierStatusTaken")}
+                            </span>
+                                                        <span className={`pill ${st === "picked_up" ? "pill--info" : "pill--muted"}`}>
+                              2 · {t("courierStatusPickedUp")}
+                            </span>
+                                                        <span className="pill pill--muted">3 · {t("courierStatusDelivered")}</span>
 
                                                         <span className={`pill ${readyText === "READY" ? "pill--success" : "pill--muted"}`}>
-                              Ready in {readyText}
+                              {readyPill}
                             </span>
                                                     </div>
                                                 </div>
@@ -929,12 +991,12 @@ export default function CourierAppHome() {
                                                 <div className="subcard">
                                                     <div className="kv">
                                                         <div className="line">
-                                                            <span>Customer</span>
+                                                            <span>{t("courierCustomerLabel")}</span>
                                                             <b>{ord.customerName ?? "—"}</b>
                                                         </div>
 
                                                         <div className="line">
-                                                            <span>Phone</span>
+                                                            <span>{t("courierPhoneLabel")}</span>
                                                             <b>
                                                                 {ord.customerPhone ? (
                                                                     <a href={`tel:${ord.customerPhone}`} style={{ textDecoration: "none" }}>
@@ -946,44 +1008,43 @@ export default function CourierAppHome() {
                                                             </b>
                                                         </div>
 
-                                                        {/* Address structured + comment */}
                                                         <div className="line" style={{ alignItems: "baseline" }}>
-                                                            <span>Address</span>
+                                                            <span>{t("courierAddressLabel")}</span>
                                                             <div style={{ textAlign: "right", fontWeight: 800 }}>
                                                                 <div>{drop.main}</div>
-                                                                {drop.extra && <div className="muted" style={{ fontWeight: 600 }}>{drop.extra}</div>}
+                                                                {extra && <div className="muted" style={{ fontWeight: 600 }}>{extra}</div>}
                                                                 {drop.comment && <div className="muted" style={{ fontWeight: 600 }}>{drop.comment}</div>}
                                                             </div>
                                                         </div>
 
                                                         <div className="line">
-                                                            <span>To restaurant</span>
+                                                            <span>{t("courierToRestaurantLabel")}</span>
                                                             <b>{courierToPickupM ? kmTextFromMeters(courierToPickupM) : "—"}</b>
                                                         </div>
 
                                                         <div className="line">
-                                                            <span>Pickup → dropoff</span>
+                                                            <span>{t("courierPickupToDropoffLabel")}</span>
                                                             <b>{pickupToDropoffM ? kmTextFromMeters(pickupToDropoffM) : "—"}</b>
                                                         </div>
 
                                                         <div className="line">
-                                                            <span>Total trip</span>
+                                                            <span>{t("courierTotalTripLabel")}</span>
                                                             <b>{courierToPickupM || pickupToDropoffM ? kmTextFromMeters(totalTripM) : "—"}</b>
                                                         </div>
 
                                                         <div className="line">
-                                                            <span>Total</span>
+                                                            <span>{t("courierTotalLabel")}</span>
                                                             <b>{money(ord.orderTotal)}</b>
                                                         </div>
 
                                                         <div className="line">
-                                                            <span>Your fee</span>
+                                                            <span>{t("courierYourFeeLabel")}</span>
                                                             <b>{money(ord.deliveryFee)}</b>
                                                         </div>
 
                                                         <div className="line">
-                                                            <span>Pay</span>
-                                                            <b>{ord.paymentType ?? "—"}</b>
+                                                            <span>{t("courierPayLabel")}</span>
+                                                            <b>{paymentLabel(ord.paymentType)}</b>
                                                         </div>
                                                     </div>
                                                 </div>
@@ -996,7 +1057,7 @@ export default function CourierAppHome() {
                                                         onClick={() => markPickedUp(ord.id)}
                                                         disabled={!canPickup || busyOrderAction !== null}
                                                     >
-                                                        {busyOrderAction === "pickup" ? "Saving…" : "Забрал заказ"}
+                                                        {busyOrderAction === "pickup" ? t("courierSaving") : t("courierPickedUpAction")}
                                                     </button>
 
                                                     <button
@@ -1004,28 +1065,28 @@ export default function CourierAppHome() {
                                                         onClick={() => markDelivered(ord.id)}
                                                         disabled={!canDeliver || busyOrderAction !== null}
                                                     >
-                                                        {busyOrderAction === "deliver" ? "Saving…" : "Доставлено"}
+                                                        {busyOrderAction === "deliver" ? t("courierSaving") : t("courierDeliveredAction")}
                                                     </button>
 
                                                     {canPickup && pickupMain && (
                                                         <a className="btn btn--ghost" href={pickupMain} target="_blank" rel="noreferrer">
-                                                            Маршрут в ресторан
+                                                            {t("courierRouteToRestaurant")}
                                                         </a>
                                                     )}
                                                     {canPickup && pickupYandex && (
                                                         <a className="btn btn--ghost" href={pickupYandex} target="_blank" rel="noreferrer">
-                                                            Яндекс
+                                                            {t("courierYandex")}
                                                         </a>
                                                     )}
 
                                                     {canDeliver && dropoffMain && (
                                                         <a className="btn btn--ghost" href={dropoffMain} target="_blank" rel="noreferrer">
-                                                            Маршрут к клиенту
+                                                            {t("courierRouteToCustomer")}
                                                         </a>
                                                     )}
                                                     {canDeliver && dropoffYandex && (
                                                         <a className="btn btn--ghost" href={dropoffYandex} target="_blank" rel="noreferrer">
-                                                            Яндекс
+                                                            {t("courierYandex")}
                                                         </a>
                                                     )}
 
@@ -1040,7 +1101,7 @@ export default function CourierAppHome() {
                                                                     await ensureChat(chatId, ord.id, String(ord.restaurantId ?? ""));
                                                                     await markChatRead(chatId);
                                                                 } catch (e: any) {
-                                                                    setErr(e?.message ?? "Failed to open chat");
+                                                                    setErr(e?.message ?? t("courierErrorOpenChat"));
                                                                     return;
                                                                 }
                                                             }
@@ -1048,7 +1109,7 @@ export default function CourierAppHome() {
                                                             toggleChat(ord.id);
                                                         }}
                                                     >
-                                                        {chatOpenByOrderId[ord.id] ? "Hide chat" : "Chat"}
+                                                        {chatOpenByOrderId[ord.id] ? t("courierHideChat") : t("courierChat")}
                                                         {hasUnread && (
                                                             <span
                                                                 style={{
@@ -1077,7 +1138,7 @@ export default function CourierAppHome() {
 
                                                 {!canDeliver && (
                                                     <div className="muted" style={{ marginTop: 10, fontSize: 13 }}>
-                                                        Tip: “Доставлено” станет доступно после “Забрал заказ”.
+                                                        {t("courierTipDeliveredAfterPickup")}
                                                     </div>
                                                 )}
                                             </div>
@@ -1093,31 +1154,40 @@ export default function CourierAppHome() {
                             <div className="card__inner">
                                 <div className="row row--between row--wrap">
                                     <div className="row row--wrap">
-                                        <h3 style={{ margin: 0 }}>New offers</h3>
+                                        <h3 style={{ margin: 0 }}>{t("courierNewOffersTitle")}</h3>
                                         <span className="pill pill--muted">{offers.length}</span>
                                     </div>
 
                                     <span className="pill pill--muted">
-                    Active {activeCount}/{MAX_ACTIVE_ORDERS}
+                    {t("courierActiveCountLabel")} {activeCount}/{MAX_ACTIVE_ORDERS}
                   </span>
 
-                                    {reachedMaxActive && <span className="pill pill--warning">Max {MAX_ACTIVE_ORDERS} active orders reached</span>}
+                                    {reachedMaxActive && (
+                                        <span className="pill pill--warning">
+                      {t("courierMaxActiveReached")} {MAX_ACTIVE_ORDERS}
+                    </span>
+                                    )}
                                 </div>
 
                                 <div className="hr" />
 
-                                {offers.length === 0 && <div className="muted">No new offers</div>}
+                                {offers.length === 0 && <div className="muted">{t("courierNoNewOffers")}</div>}
 
                                 <div className="stack">
                                     {offers.map((o) => {
-                                        const pickupMain = wazeUrl(o.pickupLat, o.pickupLng) ?? googleMapsUrl(o.pickupLat, o.pickupLng);
+                                        const pickupMain =
+                                            wazeUrl(o.pickupLat, o.pickupLng) ?? googleMapsUrl(o.pickupLat, o.pickupLng);
                                         const pickupYandex = yandexMapsUrl(o.pickupLat, o.pickupLng);
 
                                         const isBusy = busyOfferId === o.id;
-
-                                        const offerCode = typeof o.shortCode === "string" && o.shortCode ? o.shortCode : shortId(o.orderId);
+                                        const offerCode =
+                                            typeof o.shortCode === "string" && o.shortCode ? o.shortCode : shortId(o.orderId);
 
                                         const readyText = readyInText(o.readyAtMs, nowMs);
+                                        const readyPill =
+                                            readyText === "READY"
+                                                ? t("courierReadyNow")
+                                                : `${t("courierReadyInLabel")} ${readyText}`;
 
                                         const courierLoc = lastGeoRef.current;
                                         const courierToPickupM =
@@ -1128,35 +1198,38 @@ export default function CourierAppHome() {
                                         const pickupToDropoffM = getPickupToDropoffMeters(o);
                                         const totalTripM = (courierToPickupM ?? 0) + (pickupToDropoffM ?? 0);
 
-                                        const drop = formatDropoff(o);
+                                        const drop = formatDropoffParts(o);
+                                        const extra = dropoffExtra(drop.apt, drop.ent);
 
                                         return (
                                             <div key={o.id} className="subcard">
                                                 <div className="row row--between row--wrap">
                                                     <div className="row row--wrap">
                                                         <div style={{ fontWeight: 950 }}>
-                                                            Order <span className="mono">#{offerCode}</span>
+                                                            {t("courierOrderLabel")} <span className="mono">#{offerCode}</span>
                                                         </div>
 
                                                         <span className={`pill ${o.paymentType === "cash" ? "pill--muted" : "pill--info"}`}>
-                              {(o.paymentType ?? "—").toUpperCase()}
+                              {paymentLabel(o.paymentType)}
                             </span>
 
-                                                        <span className="pill pill--success">Fee {money(o.deliveryFee)}</span>
+                                                        <span className="pill pill--success">
+                              {t("courierFeeLabel")} {money(o.deliveryFee)}
+                            </span>
 
                                                         <span className={`pill ${readyText === "READY" ? "pill--success" : "pill--muted"}`}>
-                              Ready in {readyText}
+                              {readyPill}
                             </span>
                                                     </div>
 
                                                     {pickupMain && (
                                                         <a className="btn btn--ghost" href={pickupMain} target="_blank" rel="noreferrer">
-                                                            Маршрут в ресторан
+                                                            {t("courierRouteToRestaurant")}
                                                         </a>
                                                     )}
                                                     {pickupYandex && (
                                                         <a className="btn btn--ghost" href={pickupYandex} target="_blank" rel="noreferrer">
-                                                            Яндекс
+                                                            {t("courierYandex")}
                                                         </a>
                                                     )}
                                                 </div>
@@ -1165,12 +1238,12 @@ export default function CourierAppHome() {
 
                                                 <div className="kv">
                                                     <div className="line">
-                                                        <span>Customer</span>
+                                                        <span>{t("courierCustomerLabel")}</span>
                                                         <b>{o.customerName ?? "—"}</b>
                                                     </div>
 
                                                     <div className="line">
-                                                        <span>Phone</span>
+                                                        <span>{t("courierPhoneLabel")}</span>
                                                         <b>
                                                             {o.customerPhone ? (
                                                                 <a href={`tel:${o.customerPhone}`} style={{ textDecoration: "none" }}>
@@ -1182,33 +1255,32 @@ export default function CourierAppHome() {
                                                         </b>
                                                     </div>
 
-                                                    {/* Address structured + comment */}
                                                     <div className="line" style={{ alignItems: "baseline" }}>
-                                                        <span>Address</span>
+                                                        <span>{t("courierAddressLabel")}</span>
                                                         <div style={{ textAlign: "right", fontWeight: 800 }}>
                                                             <div>{drop.main}</div>
-                                                            {drop.extra && <div className="muted" style={{ fontWeight: 600 }}>{drop.extra}</div>}
+                                                            {extra && <div className="muted" style={{ fontWeight: 600 }}>{extra}</div>}
                                                             {drop.comment && <div className="muted" style={{ fontWeight: 600 }}>{drop.comment}</div>}
                                                         </div>
                                                     </div>
 
                                                     <div className="line">
-                                                        <span>To restaurant</span>
+                                                        <span>{t("courierToRestaurantLabel")}</span>
                                                         <b>{courierToPickupM ? kmTextFromMeters(courierToPickupM) : "—"}</b>
                                                     </div>
 
                                                     <div className="line">
-                                                        <span>Pickup → dropoff</span>
+                                                        <span>{t("courierPickupToDropoffLabel")}</span>
                                                         <b>{pickupToDropoffM ? kmTextFromMeters(pickupToDropoffM) : "—"}</b>
                                                     </div>
 
                                                     <div className="line">
-                                                        <span>Total trip</span>
+                                                        <span>{t("courierTotalTripLabel")}</span>
                                                         <b>{courierToPickupM || pickupToDropoffM ? kmTextFromMeters(totalTripM) : "—"}</b>
                                                     </div>
 
                                                     <div className="line">
-                                                        <span>Total</span>
+                                                        <span>{t("courierTotalLabel")}</span>
                                                         <b>{money(o.orderTotal)}</b>
                                                     </div>
                                                 </div>
@@ -1216,12 +1288,16 @@ export default function CourierAppHome() {
                                                 <div style={{ height: 12 }} />
 
                                                 <div className="row row--wrap row--mobile-stack">
-                                                    <button className="btn btn--success" onClick={() => acceptOffer(o)} disabled={isBusy || reachedMaxActive}>
-                                                        {isBusy ? "Working…" : "Accept"}
+                                                    <button
+                                                        className="btn btn--success"
+                                                        onClick={() => acceptOffer(o)}
+                                                        disabled={isBusy || reachedMaxActive}
+                                                    >
+                                                        {isBusy ? t("courierWorking") : t("courierAccept")}
                                                     </button>
 
                                                     <button className="btn btn--danger" onClick={() => declineOffer(o.id)} disabled={isBusy}>
-                                                        {isBusy ? "Working…" : "Decline"}
+                                                        {isBusy ? t("courierWorking") : t("courierDecline")}
                                                     </button>
                                                 </div>
                                             </div>
@@ -1230,7 +1306,7 @@ export default function CourierAppHome() {
                                 </div>
 
                                 <div className="muted" style={{ marginTop: 12, fontSize: 12 }}>
-                                    Presence updates while the app is open.
+                                    {t("courierPresenceHint")}
                                 </div>
                             </div>
                         </div>
@@ -1245,53 +1321,55 @@ export default function CourierAppHome() {
                         <div className="card">
                             <div className="card__inner">
                                 <div className="row row--between row--wrap">
-                                    <h3 style={{ margin: 0 }}>Выполненные заказы</h3>
+                                    <h3 style={{ margin: 0 }}>{t("courierCompletedOrdersTitle")}</h3>
                                     <span className="pill pill--muted">{completedOrders.length}</span>
                                 </div>
 
                                 <div className="hr" />
 
-                                {completedOrders.length === 0 && <div className="muted">Пока нет выполненных заказов</div>}
+                                {completedOrders.length === 0 && <div className="muted">{t("courierNoCompletedOrders")}</div>}
 
                                 <div className="stack">
                                     {completedOrders.map((o: any) => {
-                                        const code = typeof o?.shortCode === "string" && o.shortCode ? o.shortCode : shortId(o.id);
-                                        const drop = formatDropoff(o);
+                                        const code =
+                                            typeof o?.shortCode === "string" && o.shortCode ? o.shortCode : shortId(o.id);
+
+                                        const drop = formatDropoffParts(o);
+                                        const extra = dropoffExtra(drop.apt, drop.ent);
 
                                         return (
                                             <div key={o.id} className="subcard">
                                                 <div className="row row--between row--wrap">
                                                     <div style={{ fontWeight: 950 }}>
-                                                        Order <span className="mono">#{code}</span>
+                                                        {t("courierOrderLabel")} <span className="mono">#{code}</span>
                                                     </div>
-                                                    <span className="pill pill--success">DELIVERED</span>
+                                                    <span className="pill pill--success">{t("courierStatusDelivered")}</span>
                                                 </div>
 
                                                 <div style={{ height: 10 }} />
 
                                                 <div className="kv">
                                                     <div className="line">
-                                                        <span>Customer</span>
+                                                        <span>{t("courierCustomerLabel")}</span>
                                                         <b>{o.customerName ?? "—"}</b>
                                                     </div>
 
-                                                    {/* Address structured + comment */}
                                                     <div className="line" style={{ alignItems: "baseline" }}>
-                                                        <span>Address</span>
+                                                        <span>{t("courierAddressLabel")}</span>
                                                         <div style={{ textAlign: "right", fontWeight: 800 }}>
                                                             <div>{drop.main}</div>
-                                                            {drop.extra && <div className="muted" style={{ fontWeight: 600 }}>{drop.extra}</div>}
+                                                            {extra && <div className="muted" style={{ fontWeight: 600 }}>{extra}</div>}
                                                             {drop.comment && <div className="muted" style={{ fontWeight: 600 }}>{drop.comment}</div>}
                                                         </div>
                                                     </div>
 
                                                     <div className="line">
-                                                        <span>Total</span>
+                                                        <span>{t("courierTotalLabel")}</span>
                                                         <b>{money(o.orderTotal)}</b>
                                                     </div>
 
                                                     <div className="line">
-                                                        <span>Your fee</span>
+                                                        <span>{t("courierYourFeeLabel")}</span>
                                                         <b>{money(o.deliveryFee)}</b>
                                                     </div>
                                                 </div>
@@ -1301,7 +1379,7 @@ export default function CourierAppHome() {
                                 </div>
 
                                 <div className="muted" style={{ marginTop: 12, fontSize: 12 }}>
-                                    Delivered orders are shown here.
+                                    {t("courierDeliveredOrdersShownHint")}
                                 </div>
                             </div>
                         </div>

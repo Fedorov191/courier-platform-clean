@@ -14,9 +14,10 @@ import {
 import { httpsCallable } from "firebase/functions";
 import { Link, useNavigate } from "react-router-dom";
 import { geohashForLocation } from "geofire-common";
+
 import { GooglePlacesAutocomplete } from "../components/GooglePlacesAutocomplete";
 import type { PlacePick } from "../components/GooglePlacesAutocomplete";
-
+import { useI18n } from "../lib/i18n";
 
 type PaymentType = "cash" | "card";
 
@@ -31,8 +32,8 @@ type FormState = {
     dropoffStreet: string;
     dropoffHouseNumber: string;
     dropoffApartment: string; // optional
-    dropoffEntrance: string;  // optional
-    dropoffComment: string;   // optional, но поле обязано быть в UI
+    dropoffEntrance: string; // optional
+    dropoffComment: string; // optional, но поле обязано быть в UI
 
     orderSubtotal: string;
     paymentType: PaymentType;
@@ -85,6 +86,7 @@ function money(n?: number) {
 
 export function NewOrderPage() {
     const navigate = useNavigate();
+    const { t } = useI18n();
 
     const [uid, setUid] = useState<string | null>(auth.currentUser?.uid ?? null);
     const [authLoading, setAuthLoading] = useState(true);
@@ -183,7 +185,7 @@ export function NewOrderPage() {
             } catch (e: any) {
                 if (!cancelled) {
                     setPickupLoaded(true);
-                    setPickupSaveError(e?.message ?? "Failed to load restaurant pickup location");
+                    setPickupSaveError(t("errorLoadPickup"));
                 }
             }
         }
@@ -192,7 +194,7 @@ export function NewOrderPage() {
         return () => {
             cancelled = true;
         };
-    }, [uid]);
+    }, [uid, t]);
 
     // Re-calc quote when we have both coords
     useEffect(() => {
@@ -223,10 +225,10 @@ export function NewOrderPage() {
                 if (reqId !== quoteReqIdRef.current) return;
 
                 setQuote(res.data as RouteQuote);
-            } catch (e: any) {
+            } catch {
                 if (cancelled) return;
                 setQuote(null);
-                setQuoteError(e?.message ?? "Failed to calculate route / delivery fee");
+                setQuoteError(t("errorCalcRouteFee"));
             } finally {
                 if (!cancelled) setQuoteLoading(false);
             }
@@ -236,7 +238,7 @@ export function NewOrderPage() {
         return () => {
             cancelled = true;
         };
-    }, [pickup.lat, pickup.lng, dropoff.lat, dropoff.lng]);
+    }, [pickup.lat, pickup.lng, dropoff.lat, dropoff.lng, t]);
 
     const update = (key: keyof FormState, value: any) => {
         setForm((prev) => ({ ...prev, [key]: value }));
@@ -279,7 +281,7 @@ export function NewOrderPage() {
         if (!uid) return;
 
         if (!(typeof pickup.lat === "number" && typeof pickup.lng === "number" && pickup.geohash)) {
-            setPickupSaveError("Выбери адрес ресторана из подсказок (нужны координаты).");
+            setPickupSaveError(t("pickupPickFromSuggestionsError"));
             return;
         }
 
@@ -301,8 +303,8 @@ export function NewOrderPage() {
             );
 
             setPickupEditMode(false);
-        } catch (e: any) {
-            setPickupSaveError(e?.message ?? "Failed to save pickup location");
+        } catch {
+            setPickupSaveError(t("errorSavePickup"));
         } finally {
             setPickupSaving(false);
         }
@@ -316,43 +318,50 @@ export function NewOrderPage() {
         const e: Errors = {};
 
         if (prepTimeMin === null) {
-            e.prepTimeMin = "Выбери время готовности (20/30/40 минут).";
+            e.prepTimeMin = t("errorPickPrepTime");
         }
 
-        if (form.customerName.trim().length < 2) e.customerName = "Укажи имя клиента.";
+        if (form.customerName.trim().length < 2) e.customerName = t("errorCustomerNameRequired");
 
         const phoneDigits = onlyDigits(form.customerPhone);
         if (phoneDigits.length < 9) {
-            e.customerPhone = "Телефон должен содержать минимум 9 цифр (обычно 10).";
+            e.customerPhone = t("errorPhoneMinDigits");
         }
 
         // Dropoff must be picked (coords + placeId)
         if (form.dropoffAddressText.trim().length < 5) {
-            e.dropoffAddressText = "Начни вводить адрес доставки.";
+            e.dropoffAddressText = t("errorStartTypingAddress");
         }
-        if (!(dropoff.lat && dropoff.lng && dropoff.geohash && dropoff.placeId)) {
-            e.dropoffPick = "Выбери адрес из подсказок Google (нужны координаты и placeId).";
+        if (
+            !(
+                typeof dropoff.lat === "number" &&
+                typeof dropoff.lng === "number" &&
+                !!dropoff.geohash &&
+                !!dropoff.placeId
+            )
+        ) {
+            e.dropoffPick = t("errorPickAddressFromSuggestions");
         }
 
         // ✅ structured fields required
-        if (form.dropoffStreet.trim().length < 2) e.dropoffStreet = "Укажи улицу.";
-        if (form.dropoffHouseNumber.trim().length < 1) e.dropoffHouseNumber = "Укажи номер дома.";
+        if (form.dropoffStreet.trim().length < 2) e.dropoffStreet = t("errorStreetRequired");
+        if (form.dropoffHouseNumber.trim().length < 1) e.dropoffHouseNumber = t("errorHouseRequired");
 
         if (!Number.isFinite(subtotal) || subtotal <= 0) {
-            e.orderSubtotal = "Стоимость заказа должна быть > 0 (например 100).";
+            e.orderSubtotal = t("errorSubtotalPositive");
         }
 
         // pickup must exist (coords) to compute route
         const hasPickup = typeof pickup.lat === "number" && typeof pickup.lng === "number";
         if (!hasPickup) {
-            e.pickupMissing = "Нужен pickup адрес ресторана (с координатами).";
+            e.pickupMissing = t("errorPickupMissing");
         }
 
         // quote required after both coords
         const hasDropoff = typeof dropoff.lat === "number" && typeof dropoff.lng === "number";
         if (hasPickup && hasDropoff && !quoteLoading) {
             if (!quote || !Number.isFinite(fee) || fee < 0) {
-                e.quote = quoteError || "Не удалось рассчитать доставку по маршруту.";
+                e.quote = quoteError || t("errorQuoteMissing");
             }
         }
 
@@ -376,6 +385,7 @@ export function NewOrderPage() {
         quoteError,
         subtotal,
         fee,
+        t,
     ]);
 
     const canSubmit =
@@ -387,8 +397,7 @@ export function NewOrderPage() {
         Number.isFinite(fee) &&
         fee >= 0;
 
-    const orderTotal =
-        (Number.isFinite(subtotal) ? subtotal : 0) + (Number.isFinite(fee) ? fee : 0);
+    const orderTotal = (Number.isFinite(subtotal) ? subtotal : 0) + (Number.isFinite(fee) ? fee : 0);
 
     const moneyFlow = useMemo(() => {
         if (!Number.isFinite(subtotal) || !Number.isFinite(fee)) {
@@ -420,7 +429,7 @@ export function NewOrderPage() {
         setWasSubmitted(true);
 
         if (!uid) {
-            setSubmitError("Нет авторизации. Перелогинься.");
+            setSubmitError(t("errorNoAuthRelogin"));
             return;
         }
 
@@ -428,15 +437,22 @@ export function NewOrderPage() {
         if (prepTimeMin === null) return;
 
         if (!(typeof pickup.lat === "number" && typeof pickup.lng === "number" && pickup.geohash)) {
-            setSubmitError("Сначала укажи pickup-адрес ресторана (из подсказок), чтобы были координаты.");
+            setSubmitError(t("errorSetPickupFirst"));
             return;
         }
-        if (!(typeof dropoff.lat === "number" && typeof dropoff.lng === "number" && dropoff.geohash && dropoff.placeId)) {
-            setSubmitError("Выбери адрес доставки из подсказок Google, чтобы были координаты.");
+        if (
+            !(
+                typeof dropoff.lat === "number" &&
+                typeof dropoff.lng === "number" &&
+                !!dropoff.geohash &&
+                !!dropoff.placeId
+            )
+        ) {
+            setSubmitError(t("errorPickDropoffFromSuggestions"));
             return;
         }
         if (!quote || !Number.isFinite(fee)) {
-            setSubmitError("Не удалось рассчитать delivery fee. Проверь адрес и попробуй ещё раз.");
+            setSubmitError(t("errorDeliveryFeeNotCalculated"));
             return;
         }
 
@@ -479,7 +495,7 @@ export function NewOrderPage() {
 
                 // backward compatibility (старые поля)
                 customerAddress: form.dropoffAddressText.trim(),
-                notes: form.dropoffComment.trim(), // раньше у тебя это было “notes” — оставим, чтобы ничего не сломать
+                notes: form.dropoffComment.trim(),
 
                 // payment
                 paymentType: form.paymentType,
@@ -528,16 +544,12 @@ export function NewOrderPage() {
                     : 0;
 
                 const nextSeq = lastSeq + 1;
-                if (nextSeq > 999) throw new Error("Daily order limit reached (999).");
+                if (nextSeq > 999) throw new Error(t("errorDailyLimit"));
 
                 const shortCode = String(nextSeq).padStart(3, "0");
                 const publicCode = `${dateKey}-${shortCode}`;
 
-                tx.set(
-                    counterRef,
-                    { lastSeq: nextSeq, updatedAt: serverTimestamp() },
-                    { merge: true }
-                );
+                tx.set(counterRef, { lastSeq: nextSeq, updatedAt: serverTimestamp() }, { merge: true });
 
                 tx.set(orderRef, {
                     ...orderDoc,
@@ -549,7 +561,7 @@ export function NewOrderPage() {
 
             navigate("/restaurant/app/orders");
         } catch (err: any) {
-            setSubmitError(err?.message ?? "Failed to create order");
+            setSubmitError(err?.message ?? t("errorCreateOrder"));
         } finally {
             setLoading(false);
         }
@@ -561,409 +573,395 @@ export function NewOrderPage() {
         return {
             width: "100%",
             padding: 10,
-            borderRadius: 8,
-            border: hasError ? "1px solid crimson" : "1px solid #333",
+            borderRadius: 10,
+            border: hasError ? "1px solid rgba(220, 38, 38, 0.55)" : "1px solid var(--border-2)",
             outline: "none",
+            background: "var(--surface)",
+            color: "var(--text)",
         } as const;
     }
 
     const Hint = ({ text }: { text: string }) => (
-        <div style={{ fontSize: 12, color: "#888", marginTop: 4 }}>{text}</div>
+        <div className="muted" style={{ fontSize: 12, marginTop: 6 }}>
+            {text}
+        </div>
     );
 
     const FieldError = ({ text }: { text?: string }) => {
         if (!text) return null;
-        return <div style={{ fontSize: 12, color: "crimson", marginTop: 4 }}>{text}</div>;
+        return (
+            <div style={{ fontSize: 12, color: "var(--danger)", marginTop: 6 }}>
+                {text}
+            </div>
+        );
     };
 
     if (authLoading) {
         return (
-            <div style={{ padding: 24 }}>
-                <h2>New order</h2>
-                <div style={{ color: "#888" }}>Checking session…</div>
+            <div className="card">
+                <div className="card__inner">
+                    <h2 style={{ margin: 0 }}>{t("newOrder")}</h2>
+                    <div className="muted" style={{ marginTop: 8 }}>
+                        {t("checkingSession")}
+                    </div>
+                </div>
             </div>
         );
     }
 
     if (!uid) {
         return (
-            <div style={{ padding: 24 }}>
-                <h2>New order</h2>
-                <div style={{ color: "crimson" }}>Нет авторизации.</div>
-                <div style={{ marginTop: 12 }}>
-                    <Link to="/restaurant/login">Go to login</Link>
+            <div className="card">
+                <div className="card__inner">
+                    <h2 style={{ margin: 0 }}>{t("newOrder")}</h2>
+                    <div className="alert alert--danger" style={{ marginTop: 12 }}>
+                        {t("noAuthSession")}
+                    </div>
+                    <div style={{ marginTop: 12 }}>
+                        <Link to="/restaurant/login">{t("goToLogin")}</Link>
+                    </div>
                 </div>
             </div>
         );
     }
 
     return (
-        <div style={{ padding: 24, maxWidth: 560, margin: "0 auto" }}>
-            <div style={{ display: "flex", justifyContent: "space-between", gap: 12 }}>
-                <h2 style={{ margin: 0 }}>New order</h2>
-                <button
-                    onClick={() => navigate("/restaurant/app/orders")}
-                    style={{
-                        padding: "8px 12px",
-                        borderRadius: 10,
-                        border: "1px solid #333",
-                        cursor: "pointer",
-                        height: 38,
-                    }}
-                >
-                    Back
+        <div className="container--narrow">
+            <div className="row row--between row--wrap row--mobile-stack" style={{ marginBottom: 12 }}>
+                <h2 style={{ margin: 0 }}>{t("newOrder")}</h2>
+                <button className="btn btn--ghost" type="button" onClick={() => navigate("/restaurant/app/orders")}>
+                    {t("back")}
                 </button>
             </div>
 
-            <form onSubmit={onSubmit} style={{ display: "grid", gap: 12, marginTop: 16 }}>
-                {/* Restaurant pickup */}
-                <div style={{ padding: 12, border: "1px solid #333", borderRadius: 12 }}>
-                    <div style={{ fontSize: 12, color: "#aaa", marginBottom: 6 }}>
-                        Restaurant pickup location (Google Places)
-                    </div>
+            <div className="card">
+                <div className="card__inner">
+                    <form onSubmit={onSubmit} className="stack">
+                        {/* Restaurant pickup */}
+                        <div className="subcard">
+                            <div className="section-title">{t("pickupSectionTitle")}</div>
+                            <div style={{ height: 10 }} />
 
-                    {!pickupLoaded ? (
-                        <div style={{ color: "#888", fontSize: 13 }}>Loading pickup…</div>
-                    ) : (
-                        <>
-                            {!pickupEditMode && pickup.lat && pickup.lng && pickup.geohash ? (
-                                <>
-                                    <div style={{ fontSize: 13 }}>
-                                        Saved: <b>{pickup.label || "—"}</b>
-                                    </div>
-
-                                    <div style={{ height: 8 }} />
-
-                                    <button
-                                        type="button"
-                                        onClick={() => setPickupEditMode(true)}
-                                        style={{
-                                            padding: "8px 12px",
-                                            borderRadius: 10,
-                                            border: "1px solid #333",
-                                            cursor: "pointer",
-                                        }}
-                                    >
-                                        Change pickup location
-                                    </button>
-                                </>
+                            {!pickupLoaded ? (
+                                <div className="muted">{t("loadingPickup")}</div>
                             ) : (
                                 <>
-                                    <GooglePlacesAutocomplete
-                                        placeholder="Pickup address (restaurant) — start typing..."
-                                        value={pickup.label}
-                                        onChangeText={onPickupTextChange}
-                                        onPick={onPickupPick}
-                                        disabled={loading || pickupSaving}
-                                        country="il"
-                                    />
+                                    {!pickupEditMode && pickup.lat && pickup.lng && pickup.geohash ? (
+                                        <>
+                                            <div style={{ fontSize: 14 }}>
+                                                {t("saved")}: <b>{pickup.label || "—"}</b>
+                                            </div>
 
-                                    <div style={{ height: 8 }} />
+                                            <div style={{ height: 10 }} />
 
-                                    <button
-                                        type="button"
-                                        onClick={savePickupToRestaurantProfile}
-                                        disabled={pickupSaving}
-                                        style={{
-                                            padding: "8px 12px",
-                                            borderRadius: 10,
-                                            border: "1px solid #333",
-                                            cursor: pickupSaving ? "not-allowed" : "pointer",
-                                        }}
-                                    >
-                                        {pickupSaving ? "Saving…" : "Save pickup location"}
-                                    </button>
+                                            <button
+                                                type="button"
+                                                className="btn btn--ghost"
+                                                onClick={() => setPickupEditMode(true)}
+                                            >
+                                                {t("changePickupLocation")}
+                                            </button>
+                                        </>
+                                    ) : (
+                                        <>
+                                            <GooglePlacesAutocomplete
+                                                placeholder={t("pickupPlaceholder")}
+                                                value={pickup.label}
+                                                onChangeText={onPickupTextChange}
+                                                onPick={onPickupPick}
+                                                disabled={loading || pickupSaving}
+                                                country="il"
+                                            />
 
-                                    {pickupSaveError && (
-                                        <div style={{ color: "crimson", marginTop: 8, fontSize: 12 }}>
-                                            {pickupSaveError}
-                                        </div>
+                                            <div style={{ height: 10 }} />
+
+                                            <button
+                                                type="button"
+                                                className="btn btn--primary"
+                                                onClick={savePickupToRestaurantProfile}
+                                                disabled={pickupSaving}
+                                            >
+                                                {pickupSaving ? t("saving") : t("savePickupLocation")}
+                                            </button>
+
+                                            {pickupSaveError && (
+                                                <div style={{ marginTop: 10 }}>
+                                                    <div className="alert alert--danger">{pickupSaveError}</div>
+                                                </div>
+                                            )}
+
+                                            <Hint text={t("pickupNeedHint")} />
+                                        </>
                                     )}
 
-                                    <div style={{ color: "#888", marginTop: 8, fontSize: 12 }}>
-                                        Нужно для расчёта маршрута и выбора ближайшего курьера.
-                                    </div>
+                                    {showErrors && errors.pickupMissing && <FieldError text={errors.pickupMissing} />}
                                 </>
                             )}
+                        </div>
 
-                            {showErrors && errors.pickupMissing && (
-                                <div style={{ color: "crimson", marginTop: 8, fontSize: 12 }}>
-                                    {errors.pickupMissing}
+                        {/* Customer */}
+                        <div>
+                            <input
+                                placeholder={t("customerNamePlaceholder")}
+                                value={form.customerName}
+                                onChange={(e) => update("customerName", e.target.value)}
+                                style={inputStyle(showErrors && !!errors.customerName)}
+                            />
+                            <FieldError text={showErrors ? errors.customerName : undefined} />
+                        </div>
+
+                        <div>
+                            <input
+                                placeholder={t("customerPhonePlaceholder")}
+                                value={form.customerPhone}
+                                onChange={(e) => update("customerPhone", e.target.value)}
+                                style={inputStyle(showErrors && !!errors.customerPhone)}
+                            />
+                            <Hint text={t("phoneDigitsHint")} />
+                            <FieldError text={showErrors ? errors.customerPhone : undefined} />
+                        </div>
+
+                        {/* Delivery address + structured */}
+                        <div className="subcard">
+                            <div className="section-title">{t("deliverySectionTitle")}</div>
+                            <div style={{ height: 10 }} />
+
+                            <GooglePlacesAutocomplete
+                                placeholder={t("deliveryPlaceholder")}
+                                value={form.dropoffAddressText}
+                                onChangeText={onDropoffTextChange}
+                                onPick={onDropoffPick}
+                                disabled={loading}
+                                country="il"
+                            />
+
+                            <FieldError text={showErrors ? errors.dropoffAddressText : undefined} />
+                            <FieldError text={showErrors ? errors.dropoffPick : undefined} />
+
+                            <Hint text={t("deliveryPickHint")} />
+
+                            <div style={{ height: 12 }} />
+
+                            <div className="row row--wrap" style={{ alignItems: "flex-start" }}>
+                                <div style={{ flex: 1, minWidth: 220 }}>
+                                    <input
+                                        placeholder={t("streetPlaceholder")}
+                                        value={form.dropoffStreet}
+                                        onChange={(e) => update("dropoffStreet", e.target.value)}
+                                        style={inputStyle(showErrors && !!errors.dropoffStreet)}
+                                    />
+                                    <FieldError text={showErrors ? errors.dropoffStreet : undefined} />
+                                </div>
+
+                                <div style={{ width: 160, minWidth: 140 }}>
+                                    <input
+                                        placeholder={t("housePlaceholder")}
+                                        value={form.dropoffHouseNumber}
+                                        onChange={(e) => update("dropoffHouseNumber", e.target.value)}
+                                        style={inputStyle(showErrors && !!errors.dropoffHouseNumber)}
+                                    />
+                                    <FieldError text={showErrors ? errors.dropoffHouseNumber : undefined} />
+                                </div>
+                            </div>
+
+                            <div style={{ height: 10 }} />
+
+                            <div className="row row--wrap" style={{ alignItems: "flex-start" }}>
+                                <div style={{ flex: 1, minWidth: 220 }}>
+                                    <input
+                                        placeholder={t("apartmentPlaceholder")}
+                                        value={form.dropoffApartment}
+                                        onChange={(e) => update("dropoffApartment", e.target.value)}
+                                        style={inputStyle(false)}
+                                    />
+                                </div>
+
+                                <div style={{ flex: 1, minWidth: 220 }}>
+                                    <input
+                                        placeholder={t("entrancePlaceholder")}
+                                        value={form.dropoffEntrance}
+                                        onChange={(e) => update("dropoffEntrance", e.target.value)}
+                                        style={inputStyle(false)}
+                                    />
+                                </div>
+                            </div>
+
+                            <div style={{ height: 10 }} />
+
+                            <textarea
+                                placeholder={t("commentPlaceholder")}
+                                value={form.dropoffComment}
+                                onChange={(e) => update("dropoffComment", e.target.value)}
+                                style={{
+                                    width: "100%",
+                                    padding: 10,
+                                    borderRadius: 10,
+                                    border: "1px solid var(--border-2)",
+                                    outline: "none",
+                                    minHeight: 90,
+                                    resize: "vertical",
+                                    background: "var(--surface)",
+                                    color: "var(--text)",
+                                }}
+                            />
+                            <Hint text={t("commentHint")} />
+                        </div>
+
+                        <div className="hr" />
+
+                        {/* Prep time */}
+                        <div className="subcard">
+                            <div className="section-title">{t("prepTimeSectionTitle")}</div>
+                            <div style={{ height: 10 }} />
+
+                            <div className="row row--wrap">
+                                {PREP_OPTIONS.map((m) => {
+                                    const active = prepTimeMin === m;
+                                    return (
+                                        <button
+                                            key={m}
+                                            type="button"
+                                            className={`btn ${active ? "btn--primary" : "btn--ghost"}`}
+                                            onClick={() => setPrepTimeMin(m)}
+                                        >
+                                            {m} {t("minShort")}
+                                        </button>
+                                    );
+                                })}
+                            </div>
+
+                            <FieldError text={showErrors ? errors.prepTimeMin : undefined} />
+                            <Hint text={t("prepTimeHint")} />
+                        </div>
+
+                        {/* Payment type */}
+                        <div className="subcard">
+                            <div className="section-title">{t("paymentTypeLabel")}</div>
+                            <div style={{ height: 10 }} />
+
+                            <div className="row row--wrap">
+                                <label className="row" style={{ gap: 8 }}>
+                                    <input
+                                        type="radio"
+                                        name="pt"
+                                        checked={form.paymentType === "cash"}
+                                        onChange={() => update("paymentType", "cash")}
+                                    />
+                                    <span>{t("paymentCash")}</span>
+                                </label>
+
+                                <label className="row" style={{ gap: 8 }}>
+                                    <input
+                                        type="radio"
+                                        name="pt"
+                                        checked={form.paymentType === "card"}
+                                        onChange={() => update("paymentType", "card")}
+                                    />
+                                    <span>{t("paymentCard")}</span>
+                                </label>
+                            </div>
+
+                            <Hint text={t("paymentHint")} />
+                        </div>
+
+                        {/* Subtotal */}
+                        <div>
+                            <input
+                                placeholder={t("subtotalPlaceholder")}
+                                value={form.orderSubtotal}
+                                onChange={(e) => update("orderSubtotal", e.target.value)}
+                                style={inputStyle(showErrors && !!errors.orderSubtotal)}
+                            />
+                            <FieldError text={showErrors ? errors.orderSubtotal : undefined} />
+                        </div>
+
+                        {/* Quote / delivery fee */}
+                        <div className="subcard">
+                            <div className="row row--between row--wrap">
+                                <span className="muted">{t("deliveryFeeAutoLabel")}</span>
+                                <b>{quoteLoading ? t("calculating") : money(quote?.deliveryFee)}</b>
+                            </div>
+
+                            <div style={{ height: 10 }} />
+
+                            {quote ? (
+                                <div className="kv">
+                                    <div className="line">
+                                        <span>{t("distanceRouteLabel")}</span>
+                                        <b>{quote.distanceKm.toFixed(2)} km</b>
+                                    </div>
+                                    <div className="line">
+                                        <span>{t("etaRouteLabel")}</span>
+                                        <b>
+                                            {Math.round(quote.durationSeconds / 60)} {t("minShort")}
+                                        </b>
+                                    </div>
+                                </div>
+                            ) : (
+                                <div className="muted">{t("routePickAddressToCalculate")}</div>
+                            )}
+
+                            {quoteError && (
+                                <div style={{ marginTop: 10 }}>
+                                    <div className="alert alert--danger">{quoteError}</div>
                                 </div>
                             )}
-                        </>
-                    )}
-                </div>
 
-                {/* Customer */}
-                <div>
-                    <input
-                        placeholder="Customer name"
-                        value={form.customerName}
-                        onChange={(e) => update("customerName", e.target.value)}
-                        style={inputStyle(showErrors && !!errors.customerName)}
-                    />
-                    <FieldError text={showErrors ? errors.customerName : undefined} />
-                </div>
-
-                <div>
-                    <input
-                        placeholder="Phone (e.g. 052-1234567)"
-                        value={form.customerPhone}
-                        onChange={(e) => update("customerPhone", e.target.value)}
-                        style={inputStyle(showErrors && !!errors.customerPhone)}
-                    />
-                    <Hint text="Можно с тире/пробелами — проверяем по цифрам." />
-                    <FieldError text={showErrors ? errors.customerPhone : undefined} />
-                </div>
-
-                {/* Delivery address (Google Places) + structured fields */}
-                <div style={{ padding: 12, border: "1px solid #333", borderRadius: 12 }}>
-                    <div style={{ fontSize: 12, color: "#aaa", marginBottom: 6 }}>
-                        Delivery address (Google Places)
-                    </div>
-
-                    <GooglePlacesAutocomplete
-                        placeholder="Delivery address — start typing..."
-                        value={form.dropoffAddressText}
-                        onChangeText={onDropoffTextChange}
-                        onPick={onDropoffPick}
-                        disabled={loading}
-                        country="il"
-                    />
-
-                    <FieldError text={showErrors ? errors.dropoffAddressText : undefined} />
-                    <FieldError text={showErrors ? errors.dropoffPick : undefined} />
-
-                    <Hint text="Важно: выбери адрес из подсказок Google — так мы получим координаты + placeId." />
-
-                    <div style={{ height: 10 }} />
-
-                    <div style={{ display: "flex", gap: 10 }}>
-                        <div style={{ flex: 1 }}>
-                            <input
-                                placeholder="Street"
-                                value={form.dropoffStreet}
-                                onChange={(e) => update("dropoffStreet", e.target.value)}
-                                style={inputStyle(showErrors && !!errors.dropoffStreet)}
-                            />
-                            <FieldError text={showErrors ? errors.dropoffStreet : undefined} />
+                            <FieldError text={showErrors ? errors.quote : undefined} />
                         </div>
 
-                        <div style={{ width: 140 }}>
-                            <input
-                                placeholder="House #"
-                                value={form.dropoffHouseNumber}
-                                onChange={(e) => update("dropoffHouseNumber", e.target.value)}
-                                style={inputStyle(showErrors && !!errors.dropoffHouseNumber)}
-                            />
-                            <FieldError text={showErrors ? errors.dropoffHouseNumber : undefined} />
-                        </div>
-                    </div>
+                        {/* Totals / money flow */}
+                        <div className="subcard">
+                            <div className="row row--between row--wrap">
+                                <span className="muted">{t("orderTotalLabel")}</span>
+                                <b>₪{Number.isFinite(orderTotal) ? orderTotal.toFixed(2) : "—"}</b>
+                            </div>
 
-                    <div style={{ height: 10 }} />
+                            <div style={{ height: 10 }} />
 
-                    <div style={{ display: "flex", gap: 10 }}>
-                        <div style={{ flex: 1 }}>
-                            <input
-                                placeholder="Apartment (optional)"
-                                value={form.dropoffApartment}
-                                onChange={(e) => update("dropoffApartment", e.target.value)}
-                                style={inputStyle(false)}
-                            />
-                        </div>
-
-                        <div style={{ flex: 1 }}>
-                            <input
-                                placeholder="Entrance (optional)"
-                                value={form.dropoffEntrance}
-                                onChange={(e) => update("dropoffEntrance", e.target.value)}
-                                style={inputStyle(false)}
-                            />
-                        </div>
-                    </div>
-
-                    <div style={{ height: 10 }} />
-
-                    {/* ✅ comment прямо под адресом */}
-                    <textarea
-                        placeholder="Delivery comment (домофон/подъезд/этаж/оставить у двери)"
-                        value={form.dropoffComment}
-                        onChange={(e) => update("dropoffComment", e.target.value)}
-                        style={{
-                            width: "100%",
-                            padding: 10,
-                            borderRadius: 8,
-                            border: "1px solid #333",
-                            outline: "none",
-                            minHeight: 80,
-                            resize: "vertical",
-                        }}
-                    />
-                    <Hint text="Комментарий относится ТОЛЬКО к доставке." />
-                </div>
-
-                <hr />
-
-                {/* Prep time */}
-                <div style={{ padding: 12, border: "1px solid #333", borderRadius: 12 }}>
-                    <div style={{ fontSize: 12, color: "#aaa", marginBottom: 8 }}>Order ready time</div>
-
-                    <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
-                        {PREP_OPTIONS.map((m) => {
-                            const active = prepTimeMin === m;
-                            return (
-                                <button
-                                    key={m}
-                                    type="button"
-                                    onClick={() => setPrepTimeMin(m)}
-                                    style={{
-                                        padding: "8px 12px",
-                                        borderRadius: 10,
-                                        border: active ? "1px solid #4ade80" : "1px solid #333",
-                                        background: active ? "rgba(74,222,128,0.12)" : "transparent",
-                                        cursor: "pointer",
-                                        fontWeight: active ? 800 : 600,
-                                    }}
-                                >
-                                    {m} min
-                                </button>
-                            );
-                        })}
-                    </div>
-
-                    <FieldError text={showErrors ? errors.prepTimeMin : undefined} />
-
-                    <div style={{ marginTop: 10, fontSize: 12, color: "#888" }}>
-                        Курьер увидит таймер “готово через …” в оффере и в активном заказе.
-                    </div>
-                </div>
-
-                {/* Payment type */}
-                <div>
-                    <label style={{ fontSize: 12, color: "#aaa" }}>Payment type</label>
-                    <div style={{ display: "flex", gap: 12, marginTop: 6 }}>
-                        <label style={{ display: "flex", gap: 6, alignItems: "center" }}>
-                            <input
-                                type="radio"
-                                name="pt"
-                                checked={form.paymentType === "cash"}
-                                onChange={() => update("paymentType", "cash")}
-                            />
-                            Cash
-                        </label>
-                        <label style={{ display: "flex", gap: 6, alignItems: "center" }}>
-                            <input
-                                type="radio"
-                                name="pt"
-                                checked={form.paymentType === "card"}
-                                onChange={() => update("paymentType", "card")}
-                            />
-                            Card
-                        </label>
-                    </div>
-
-                    <Hint text="Cash: курьер берёт деньги у клиента. Card: клиент оплатил ресторану, курьер денег у клиента не берёт, delivery fee получает в ресторане." />
-                </div>
-
-                {/* Subtotal */}
-                <div>
-                    <input
-                        placeholder="Order subtotal (₪) — стоимость еды"
-                        value={form.orderSubtotal}
-                        onChange={(e) => update("orderSubtotal", e.target.value)}
-                        style={inputStyle(showErrors && !!errors.orderSubtotal)}
-                    />
-                    <FieldError text={showErrors ? errors.orderSubtotal : undefined} />
-                </div>
-
-                {/* Quote / delivery fee */}
-                <div style={{ padding: 12, border: "1px solid #333", borderRadius: 12 }}>
-                    <div style={{ display: "flex", justifyContent: "space-between", gap: 12 }}>
-                        <span style={{ color: "#aaa" }}>Delivery fee (auto)</span>
-                        <b>{quoteLoading ? "Calculating…" : money(quote?.deliveryFee)}</b>
-                    </div>
-
-                    <div style={{ marginTop: 8, fontSize: 13, color: "#ddd" }}>
-                        {quote ? (
-                            <>
-                                <div>
-                                    Distance (route): <b>{quote.distanceKm.toFixed(2)} km</b>
+                            {form.paymentType === "cash" ? (
+                                <div className="kv">
+                                    <div className="line">
+                                        <span>{t("cashCourierPaysRestaurant")}</span>
+                                        <b>₪{moneyFlow.courierPaysAtPickup.toFixed(2)}</b>
+                                    </div>
+                                    <div className="line">
+                                        <span>{t("cashCourierCollectsFromCustomer")}</span>
+                                        <b>₪{moneyFlow.courierCollectsFromCustomer.toFixed(2)}</b>
+                                    </div>
+                                    <div className="line">
+                                        <span>{t("courierKeepsDeliveryFee")}</span>
+                                        <b>₪{Number.isFinite(fee) ? fee.toFixed(2) : "—"}</b>
+                                    </div>
                                 </div>
-                                <div>
-                                    ETA (route): <b>{Math.round(quote.durationSeconds / 60)} min</b>
+                            ) : (
+                                <div className="kv">
+                                    <div className="line">
+                                        <span>{t("cashCourierCollectsFromCustomer")}</span>
+                                        <b>₪0.00</b>
+                                    </div>
+                                    <div className="line">
+                                        <span>{t("cardRestaurantPaysCourier")}</span>
+                                        <b>₪{moneyFlow.courierGetsFromRestaurantAtPickup.toFixed(2)}</b>
+                                    </div>
                                 </div>
-                            </>
-                        ) : (
-                            <div style={{ color: "#888" }}>
-                                Выбери адрес доставки из подсказок, чтобы рассчитать маршрут.
+                            )}
+                        </div>
+
+                        <button className="btn btn--primary" disabled={loading || quoteLoading || !canSubmit}>
+                            {loading ? t("creating") : t("createOrder")}
+                        </button>
+
+                        {!canSubmit && showErrors && (
+                            <div style={{ fontSize: 12, color: "var(--danger)" }}>
+                                {t("fixHighlightedFields")}
                             </div>
                         )}
-                    </div>
 
-                    {quoteError && (
-                        <div style={{ marginTop: 8, color: "crimson", fontSize: 12 }}>{quoteError}</div>
-                    )}
-
-                    <FieldError text={showErrors ? errors.quote : undefined} />
+                        {submitError && <div className="alert alert--danger">{submitError}</div>}
+                    </form>
                 </div>
-
-                {/* Totals / money flow */}
-                <div style={{ padding: 12, border: "1px solid #333", borderRadius: 12 }}>
-                    <div style={{ display: "flex", justifyContent: "space-between" }}>
-                        <span style={{ color: "#aaa" }}>Order total</span>
-                        <b>₪{Number.isFinite(orderTotal) ? orderTotal.toFixed(2) : "—"}</b>
-                    </div>
-
-                    <div style={{ marginTop: 8, fontSize: 13, color: "#ddd" }}>
-                        {form.paymentType === "cash" ? (
-                            <>
-                                <div>
-                                    Курьер отдает ресторану при выдаче:{" "}
-                                    <b>₪{moneyFlow.courierPaysAtPickup.toFixed(2)}</b>
-                                </div>
-                                <div>
-                                    Курьер берет с клиента:{" "}
-                                    <b>₪{moneyFlow.courierCollectsFromCustomer.toFixed(2)}</b>
-                                </div>
-                                <div>
-                                    Курьер оставляет себе (доставка):{" "}
-                                    <b>₪{Number.isFinite(fee) ? fee.toFixed(2) : "—"}</b>
-                                </div>
-                            </>
-                        ) : (
-                            <>
-                                <div>Курьер берет с клиента: <b>₪0.00</b></div>
-                                <div>
-                                    Ресторан выдает курьеру (доставка):{" "}
-                                    <b>₪{moneyFlow.courierGetsFromRestaurantAtPickup.toFixed(2)}</b>
-                                </div>
-                            </>
-                        )}
-                    </div>
-                </div>
-
-                <button
-                    disabled={loading || quoteLoading || !canSubmit}
-                    style={{
-                        padding: 12,
-                        borderRadius: 10,
-                        border: "1px solid #333",
-                        cursor: loading || quoteLoading || !canSubmit ? "not-allowed" : "pointer",
-                        opacity: loading || quoteLoading || !canSubmit ? 0.7 : 1,
-                    }}
-                >
-                    {loading ? "Creating…" : "Create order"}
-                </button>
-
-                {!canSubmit && showErrors && (
-                    <div style={{ fontSize: 12, color: "crimson" }}>
-                        Исправь поля, подсвеченные красным.
-                    </div>
-                )}
-
-                {submitError && <div style={{ color: "crimson" }}>{submitError}</div>}
-            </form>
+            </div>
         </div>
     );
 }

@@ -214,3 +214,24 @@ a { color: inherit; }
     .btn { width: 100%; }
     .row--mobile-stack { flex-direction: column; align-items: stretch; }
 }
+/* Включаем RTL точечно через class на body */
+body.rtl {
+    direction: rtl;
+}
+
+/* Чтобы хедер и меню выглядели естественно справа-налево */
+body.rtl .topnav {
+    flex-direction: row-reverse;
+}
+
+body.rtl .navlinks {
+    direction: rtl;
+}
+
+/* Часто полезно: текстовые блоки выравнивать по правому краю */
+body.rtl .brand,
+body.rtl .navlinks,
+body.rtl .card,
+body.rtl .subcard {
+    text-align: right;
+}
