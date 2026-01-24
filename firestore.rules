@@ -17,13 +17,13 @@ service cloud.firestore {
         && exists(/databases/$(database)/documents/couriers/$(request.auth.uid));
     }
 
+    function onlyChanges(keys) {
+      return request.resource.data.diff(resource.data).affectedKeys().hasOnly(keys);
+    }
+
     function offerStatusOnlyChange() {
       return request.resource.data.diff(resource.data).affectedKeys()
         .hasOnly(["status", "updatedAt"]);
-    }
-
-    function onlyChanges(keys) {
-      return request.resource.data.diff(resource.data).affectedKeys().hasOnly(keys);
     }
 
     // Курьер читает заказ только если:
@@ -70,23 +70,30 @@ service cloud.firestore {
     }
 
     // ----------------------------
-    // CHAT HELPERS
+    // CHAT HELPERS (FIXED)
     // ----------------------------
+
+    // ВАЖНО:
+    // - для /chats/{chatId} НЕ используем get() (иначе рекурсия)
+    function isChatDocParticipant() {
+      return signedIn()
+        && (
+          resource.data.restaurantId == request.auth.uid
+          || resource.data.courierId == request.auth.uid
+        );
+    }
+
+    // Для messages нужно читать parent chat doc через get()
+    function chatDoc(chatId) {
+      return get(/databases/$(database)/documents/chats/$(chatId));
+    }
+
     function isChatParticipant(chatId) {
       return signedIn()
         && exists(/databases/$(database)/documents/chats/$(chatId))
         && (
-          get(/databases/$(database)/documents/chats/$(chatId)).data.restaurantId == request.auth.uid
-          || get(/databases/$(database)/documents/chats/$(chatId)).data.courierId == request.auth.uid
-        );
-    }
-
-    function canCreateChat() {
-      return signedIn()
-        && request.resource.data.keys().hasAll(["orderId","restaurantId","courierId"])
-        && (
-          request.resource.data.restaurantId == request.auth.uid
-          || request.resource.data.courierId == request.auth.uid
+          chatDoc(chatId).data.restaurantId == request.auth.uid
+          || chatDoc(chatId).data.courierId == request.auth.uid
         );
     }
 
@@ -96,8 +103,37 @@ service cloud.firestore {
         && request.resource.data.courierId == resource.data.courierId;
     }
 
+    // Создание чата:
+    // - id должен быть {orderId}_{courierId}
+    // - order должен существовать
+    // - restaurantId должен совпасть с order.restaurantId
+    // - courierId должен быть assignedCourierId ИЛИ currentOfferCourierId
+    function canCreateChat(chatId) {
+      return signedIn()
+        && request.resource.data.keys().hasAll(["orderId", "restaurantId", "courierId"])
+        && request.resource.data.orderId is string
+        && request.resource.data.restaurantId is string
+        && request.resource.data.courierId is string
+        && chatId == (request.resource.data.orderId + "_" + request.resource.data.courierId)
+        && (
+          request.auth.uid == request.resource.data.restaurantId
+          || request.auth.uid == request.resource.data.courierId
+        )
+        && exists(/databases/$(database)/documents/orders/$(request.resource.data.orderId))
+        && (
+          get(/databases/$(database)/documents/orders/$(request.resource.data.orderId)).data.restaurantId
+            == request.resource.data.restaurantId
+        )
+        && (
+          get(/databases/$(database)/documents/orders/$(request.resource.data.orderId)).data.assignedCourierId
+            == request.resource.data.courierId
+          || get(/databases/$(database)/documents/orders/$(request.resource.data.orderId)).data.currentOfferCourierId
+            == request.resource.data.courierId
+        );
+    }
+
     // ----------------------------
-    // Restaurants: только свой документ
+    // Restaurants
     // ----------------------------
     match /restaurants/{restaurantId} {
       allow read, write: if signedIn() && request.auth.uid == restaurantId;
@@ -108,7 +144,7 @@ service cloud.firestore {
     }
 
     // ----------------------------
-    // Couriers: только свой документ
+    // Couriers
     // ----------------------------
     match /couriers/{courierId} {
       allow read, write: if signedIn() && request.auth.uid == courierId;
@@ -123,19 +159,19 @@ service cloud.firestore {
     }
 
     // ----------------------------
-    // Chats (верхний уровень)
+    // Chats
     // ----------------------------
     match /chats/{chatId} {
-      allow read: if isChatParticipant(chatId);
-      allow create: if canCreateChat();
-      allow update: if isChatParticipant(chatId) && immutableChatFields();
+      allow read: if isChatDocParticipant();
+      allow create: if canCreateChat(chatId);
+      allow update: if isChatDocParticipant() && immutableChatFields();
       allow delete: if false;
 
       match /messages/{msgId} {
         allow read: if isChatParticipant(chatId);
 
         allow create: if isChatParticipant(chatId)
-          && request.resource.data.keys().hasOnly(["text","senderId","senderRole","createdAt"])
+          && request.resource.data.keys().hasOnly(["text", "senderId", "senderRole", "createdAt"])
           && request.resource.data.text is string
           && request.resource.data.text.size() > 0
           && request.resource.data.text.size() <= 1000
@@ -178,9 +214,7 @@ service cloud.firestore {
     // Offers
     // ----------------------------
     match /offers/{offerId} {
-
-      // offers создаёт только Cloud Functions (Admin SDK)
-      allow create: if false;
+      allow create: if false; // только Cloud Functions (Admin SDK)
 
       allow read: if signedIn() && (
         (isCourier() && resource.data.courierId == request.auth.uid)

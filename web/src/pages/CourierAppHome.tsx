@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { auth, db } from "../lib/firebase";
 import { OrderChat } from "../components/OrderChat";
 
@@ -16,9 +16,6 @@ import {
 import { signOut } from "firebase/auth";
 import { useNavigate } from "react-router-dom";
 import { geohashForLocation } from "geofire-common";
-
-// @ts-ignore
-type Role = "courier" | "restaurant";
 
 type Offer = {
     id: string;
@@ -51,11 +48,10 @@ type Offer = {
     courierGetsFromRestaurantAtPickup?: number;
 
     shortCode?: string;
-    publicCode?: string;
-    codeDateKey?: string;
 
     prepTimeMin?: number;
     readyAtMs?: number;
+
     routeDistanceMeters?: number;
     routeDurationSeconds?: number;
 };
@@ -64,7 +60,6 @@ function shortId(id: string) {
     return (id || "").slice(0, 6).toUpperCase();
 }
 
-// ✅ Возвращаем сразу 3 ключа отчётов (строки)
 function israelDateKey(d = new Date()) {
     const parts = new Intl.DateTimeFormat("en-CA", {
         timeZone: "Asia/Jerusalem",
@@ -76,10 +71,11 @@ function israelDateKey(d = new Date()) {
     const y = parts.find((p) => p.type === "year")?.value ?? "0000";
     const m = parts.find((p) => p.type === "month")?.value ?? "00";
     const day = parts.find((p) => p.type === "day")?.value ?? "00";
+
     return {
-        deliveredDateKey: `${y}-${m}-${day}`, // YYYY-MM-DD
-        deliveredMonthKey: `${y}-${m}`,       // YYYY-MM
-        deliveredYearKey: `${y}`,             // YYYY
+        deliveredDateKey: `${y}-${m}-${day}`,
+        deliveredMonthKey: `${y}-${m}`,
+        deliveredYearKey: `${y}`,
     };
 }
 
@@ -92,12 +88,10 @@ function wazeUrl(lat?: number, lng?: number) {
     if (typeof lat !== "number" || typeof lng !== "number") return null;
     return `https://waze.com/ul?ll=${lat},${lng}&navigate=yes`;
 }
-
 function yandexMapsUrl(lat?: number, lng?: number) {
     if (typeof lat !== "number" || typeof lng !== "number") return null;
     return `https://yandex.com/maps/?pt=${lng},${lat}&z=17&l=map`;
 }
-
 function googleMapsUrl(lat?: number, lng?: number) {
     if (typeof lat !== "number" || typeof lng !== "number") return null;
     return `https://www.google.com/maps?q=${lat},${lng}`;
@@ -106,8 +100,8 @@ function googleMapsUrl(lat?: number, lng?: number) {
 const MAX_ACTIVE_ORDERS = 3;
 const MAX_PENDING_OFFERS = 3;
 
-const GEO_WRITE_MIN_MS = 60_000; // Firestore write <= 1/min
-const GEO_MIN_MOVE_M = 150;      // or if moved >= 150m
+const GEO_WRITE_MIN_MS = 60_000;
+const GEO_MIN_MOVE_M = 150;
 
 function haversineMeters(lat1: number, lon1: number, lat2: number, lon2: number) {
     const R = 6371000;
@@ -123,8 +117,6 @@ function haversineMeters(lat1: number, lon1: number, lat2: number, lon2: number)
 
 function pillToneForOrderStatus(status?: string) {
     switch (status) {
-        case "new":
-            return "info";
         case "taken":
             return "warning";
         case "picked_up":
@@ -133,6 +125,8 @@ function pillToneForOrderStatus(status?: string) {
             return "success";
         case "cancelled":
             return "danger";
+        case "new":
+            return "info";
         default:
             return "muted";
     }
@@ -152,12 +146,11 @@ function labelForOrderStatus(status?: string) {
             return (status || "—").toUpperCase();
     }
 }
+
 function readyInText(readyAtMs?: number, nowMs?: number) {
     if (typeof readyAtMs !== "number" || !Number.isFinite(readyAtMs)) return "—";
-
     const diff = readyAtMs - (typeof nowMs === "number" ? nowMs : Date.now());
     if (diff <= 0) return "READY";
-
     const totalSec = Math.ceil(diff / 1000);
     const mm = Math.floor(totalSec / 60);
     const ss = totalSec % 60;
@@ -190,26 +183,25 @@ export default function CourierAppHome() {
 
     const [offers, setOffers] = useState<Offer[]>([]);
     const [activeOrders, setActiveOrders] = useState<any[]>([]);
-
-    const [tab, setTab] = useState<"active" | "completed">("active");
     const [completedOrders, setCompletedOrders] = useState<any[]>([]);
+    const [tab, setTab] = useState<"active" | "completed">("active");
 
     const [busyOfferId, setBusyOfferId] = useState<string | null>(null);
     const [busyOrderAction, setBusyOrderAction] = useState<"pickup" | "deliver" | null>(null);
+
+    // chat open per orderId
     const [chatOpenByOrderId, setChatOpenByOrderId] = useState<Record<string, boolean>>({});
-    // ✅ chat unread badges
-    const [unreadByOrderId, setUnreadByOrderId] = useState<Record<string, boolean>>({});
+
+    // unread per chatId
+    const [unreadByChatId, setUnreadByChatId] = useState<Record<string, boolean>>({});
     const chatLastMsgAtByChatIdRef = useRef<Record<string, number>>({});
 
-// чтобы в onSnapshot видеть актуально открытые чаты (без ресабскрайба)
     const chatOpenRef = useRef(chatOpenByOrderId);
     useEffect(() => {
         chatOpenRef.current = chatOpenByOrderId;
     }, [chatOpenByOrderId]);
 
-    // ✅ ticker for countdowns (ready timer)
     const [nowMs, setNowMs] = useState(() => Date.now());
-
     useEffect(() => {
         const id = window.setInterval(() => setNowMs(Date.now()), 1000);
         return () => window.clearInterval(id);
@@ -220,33 +212,26 @@ export default function CourierAppHome() {
     }
 
     // =======================
-    // AUDIO: beep каждую секунду пока есть offers
+    // AUDIO
     // =======================
     const audioCtxRef = useRef<AudioContext | null>(null);
 
     function primeAudio() {
         const A = window.AudioContext || (window as any).webkitAudioContext;
         if (!A) return;
-
         if (!audioCtxRef.current) audioCtxRef.current = new A();
-
         if (audioCtxRef.current.state === "suspended") {
             audioCtxRef.current.resume().catch(() => {});
         }
     }
 
-    function playBeep() {
+    function playOfferBeep() {
         const ctx = audioCtxRef.current;
         if (!ctx) return;
-
-        if (ctx.state === "suspended") {
-            ctx.resume().catch(() => {});
-            return;
-        }
+        if (ctx.state === "suspended") return;
 
         const osc = ctx.createOscillator();
         const gain = ctx.createGain();
-
         osc.type = "sine";
         osc.frequency.value = 880;
         gain.gain.value = 0.05;
@@ -258,20 +243,16 @@ export default function CourierAppHome() {
         osc.start(t0);
         osc.stop(t0 + 0.08);
     }
+
     function playChatBeep() {
         const ctx = audioCtxRef.current;
         if (!ctx) return;
-
-        if (ctx.state === "suspended") {
-            ctx.resume().catch(() => {});
-            return;
-        }
+        if (ctx.state === "suspended") return;
 
         const osc = ctx.createOscillator();
         const gain = ctx.createGain();
-
         osc.type = "sine";
-        osc.frequency.value = 660; // другой тон, чтобы отличать от offers
+        osc.frequency.value = 660;
         gain.gain.value = 0.06;
 
         osc.connect(gain);
@@ -282,14 +263,54 @@ export default function CourierAppHome() {
         osc.stop(t0 + 0.06);
     }
 
+    // первый user gesture
+    useEffect(() => {
+        const handler = () => primeAudio();
+        window.addEventListener("pointerdown", handler, { once: true });
+        return () => window.removeEventListener("pointerdown", handler);
+    }, []);
+
+    // offers beep каждую секунду пока есть offers
     useEffect(() => {
         if (!isOnline) return;
         if (offers.length === 0) return;
 
-        playBeep();
-        const id = window.setInterval(() => playBeep(), 1000);
+        playOfferBeep();
+        const id = window.setInterval(() => playOfferBeep(), 1000);
         return () => window.clearInterval(id);
     }, [isOnline, offers.length]);
+
+    const markChatRead = useCallback(
+        async (chatId: string) => {
+            if (!user) return;
+            try {
+                await updateDoc(doc(db, "chats", chatId), {
+                    lastReadAtCourier: serverTimestamp(),
+                    courierLastReadAt: serverTimestamp(), // совместимость
+                    updatedAt: serverTimestamp(),
+                });
+            } catch {}
+        },
+        [user]
+    );
+
+    async function ensureChat(chatId: string, orderId: string, restaurantId: string) {
+        if (!user) return;
+
+        await setDoc(
+            doc(db, "chats", chatId),
+            {
+                orderId,
+                restaurantId,
+                courierId: user.uid,
+                updatedAt: serverTimestamp(),
+                createdAt: serverTimestamp(),
+                lastReadAtCourier: serverTimestamp(),
+                courierLastReadAt: serverTimestamp(),
+            },
+            { merge: true }
+        );
+    }
 
     // ensure courier docs
     useEffect(() => {
@@ -300,11 +321,7 @@ export default function CourierAppHome() {
 
             try {
                 await setDoc(courierPrivateRef, { updatedAt: serverTimestamp() }, { merge: true });
-                await setDoc(
-                    courierPublicRef,
-                    { courierId: user.uid, updatedAt: serverTimestamp() },
-                    { merge: true }
-                );
+                await setDoc(courierPublicRef, { courierId: user.uid, updatedAt: serverTimestamp() }, { merge: true });
             } catch (e: any) {
                 if (!cancelled) setErr(e?.message ?? "Failed to init courier docs");
             }
@@ -316,18 +333,18 @@ export default function CourierAppHome() {
         };
     }, [user, courierPrivateRef, courierPublicRef]);
 
-    // subscribe to pending offers
+    // subscribe offers
     useEffect(() => {
         if (!user) return;
 
-        const q = query(
+        const qOffers = query(
             collection(db, "offers"),
             where("courierId", "==", user.uid),
             where("status", "==", "pending")
         );
 
         const unsub = onSnapshot(
-            q,
+            qOffers,
             (snap) => {
                 const list: Offer[] = snap.docs.map((d) => {
                     const data: any = d.data();
@@ -339,8 +356,6 @@ export default function CourierAppHome() {
                         status: String(data.status ?? "pending"),
 
                         shortCode: data.shortCode,
-                        publicCode: data.publicCode,
-                        codeDateKey: data.codeDateKey,
 
                         customerName: data.customerName,
                         customerPhone: data.customerPhone,
@@ -367,9 +382,9 @@ export default function CourierAppHome() {
 
                         prepTimeMin: data.prepTimeMin,
                         readyAtMs: data.readyAtMs,
+
                         routeDistanceMeters: data.routeDistanceMeters,
                         routeDurationSeconds: data.routeDurationSeconds,
-
                     };
                 });
 
@@ -381,18 +396,18 @@ export default function CourierAppHome() {
         return () => unsub();
     }, [user]);
 
-    // subscribe to active orders
+    // active orders
     useEffect(() => {
         if (!user) return;
 
-        const q = query(
+        const qActive = query(
             collection(db, "orders"),
             where("assignedCourierId", "==", user.uid),
             where("status", "in", ["taken", "picked_up"])
         );
 
         const unsub = onSnapshot(
-            q,
+            qActive,
             (snap) => setActiveOrders(snap.docs.map((d) => ({ id: d.id, ...d.data() }))),
             (e: any) => setErr(e?.message ?? "Failed to load active orders")
         );
@@ -400,7 +415,34 @@ export default function CourierAppHome() {
         return () => unsub();
     }, [user]);
 
-    // subscribe to completed (delivered) orders
+    // completed orders
+    useEffect(() => {
+        if (!user) return;
+
+        const qCompleted = query(
+            collection(db, "orders"),
+            where("assignedCourierId", "==", user.uid),
+            where("status", "==", "delivered")
+        );
+
+        const unsub = onSnapshot(
+            qCompleted,
+            (snap) => {
+                const list = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+                list.sort((a: any, b: any) => {
+                    const ta = a?.deliveredAt?.seconds ?? 0;
+                    const tb = b?.deliveredAt?.seconds ?? 0;
+                    return tb - ta;
+                });
+                setCompletedOrders(list);
+            },
+            (e: any) => setErr(e?.message ?? "Failed to load completed orders")
+        );
+
+        return () => unsub();
+    }, [user]);
+
+    // chats (courier) => unread + beep
     useEffect(() => {
         if (!user) return;
 
@@ -413,70 +455,52 @@ export default function CourierAppHome() {
 
                 for (const d of snap.docs) {
                     const data: any = d.data();
+                    const chatId = d.id;
 
                     const orderId = String(data.orderId ?? "");
                     if (!orderId) continue;
 
                     const lastAtMs = data.lastMessageAt?.toMillis?.() ?? 0;
                     const lastSenderId = String(data.lastMessageSenderId ?? "");
-                    const readAtMs = data.lastReadAtCourier?.toMillis?.() ?? 0;
+
+                    const readAtMs =
+                        (data.lastReadAtCourier ?? data.courierLastReadAt)?.toMillis?.() ?? 0;
 
                     const isUnread = lastAtMs > readAtMs && lastSenderId && lastSenderId !== user.uid;
-                    if (typeof isUnread === "boolean") {
-                        nextUnread[orderId] = isUnread;
+                    nextUnread[chatId] = !!isUnread;
+
+                    const prevMs = chatLastMsgAtByChatIdRef.current[chatId];
+
+                    // первый снапшот — не бипаем
+                    if (typeof prevMs !== "number") {
+                        chatLastMsgAtByChatIdRef.current[chatId] = lastAtMs;
+                        continue;
                     }
 
-                    // 🔔 beep только на новые сообщения (не на первый загрузочный снапшот)
-                    const prevMs = chatLastMsgAtByChatIdRef.current[d.id];
+                    // новое сообщение
+                    if (lastAtMs > prevMs) {
+                        chatLastMsgAtByChatIdRef.current[chatId] = lastAtMs;
 
-                    if (typeof prevMs !== "number") {
-                        chatLastMsgAtByChatIdRef.current[d.id] = lastAtMs;
-                    } else if (lastAtMs > prevMs) {
-                        chatLastMsgAtByChatIdRef.current[d.id] = lastAtMs;
+                        const isChatOpen = !!chatOpenRef.current[orderId];
 
-                        // сообщение не от меня + чат закрыт -> бип
-                        const isChatClosed = !chatOpenRef.current[orderId];
-                        if (lastSenderId && lastSenderId !== user.uid && isChatClosed) {
-                            playChatBeep();
+                        if (lastSenderId && lastSenderId !== user.uid) {
+                            if (!isChatOpen) {
+                                playChatBeep();
+                            } else {
+                                // чат открыт — сразу считаем прочитанным
+                                markChatRead(chatId);
+                            }
                         }
                     }
                 }
 
-                setUnreadByOrderId(nextUnread);
+                setUnreadByChatId(nextUnread);
             },
             () => {}
         );
 
         return () => unsub();
-    }, [user]);
-
-    useEffect(() => {
-        if (!user) return;
-
-        const q = query(
-            collection(db, "orders"),
-            where("assignedCourierId", "==", user.uid),
-            where("status", "==", "delivered")
-        );
-
-        const unsub = onSnapshot(
-            q,
-            (snap) => {
-                const list = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
-
-                list.sort((a: any, b: any) => {
-                    const ta = a?.deliveredAt?.seconds ?? 0;
-                    const tb = b?.deliveredAt?.seconds ?? 0;
-                    return tb - ta;
-                });
-
-                setCompletedOrders(list);
-            },
-            (e: any) => setErr(e?.message ?? "Failed to load completed orders")
-        );
-
-        return () => unsub();
-    }, [user]);
+    }, [user, markChatRead]);
 
     async function setOnline(next: boolean) {
         if (!user || !courierPrivateRef || !courierPublicRef) return;
@@ -590,7 +614,6 @@ export default function CourierAppHome() {
         );
     }
 
-    // Accept offer (first courier wins)
     async function acceptOffer(offer: Offer) {
         if (!auth.currentUser) return;
 
@@ -605,7 +628,6 @@ export default function CourierAppHome() {
             await runTransaction(db, async (tx) => {
                 const orderSnap = await tx.get(orderRef);
                 if (!orderSnap.exists()) throw new Error("Order not found");
-
                 const orderData: any = orderSnap.data();
 
                 if (orderData.status === "cancelled" || orderData.status === "delivered") {
@@ -661,20 +683,16 @@ export default function CourierAppHome() {
         }
     }
 
-    // ✅ FIX: распыляем ключи, а не кладём объект в deliveredDateKey
     async function markDelivered(orderId: string) {
         setBusyOrderAction("deliver");
         setErr(null);
 
         try {
             const keys = israelDateKey();
-
             await updateDoc(doc(db, "orders", orderId), {
                 status: "delivered",
                 deliveredAt: serverTimestamp(),
-
-                ...keys, // ✅ deliveredDateKey/monthKey/yearKey = строки
-
+                ...keys,
                 updatedAt: serverTimestamp(),
             });
         } catch (e: any) {
@@ -733,7 +751,7 @@ export default function CourierAppHome() {
                                 <button
                                     className="btn btn--success"
                                     onClick={() => {
-                                        primeAudio(); // ✅ важно: user gesture
+                                        primeAudio();
                                         setOnline(true);
                                     }}
                                     disabled={isOnline}
@@ -808,6 +826,9 @@ export default function CourierAppHome() {
                                         googleMapsUrl(ord?.dropoffLat, ord?.dropoffLng);
                                     const dropoffYandex = yandexMapsUrl(ord?.dropoffLat, ord?.dropoffLng);
 
+                                    const chatId = `${ord.id}_${user.uid}`;
+                                    const hasUnread = !!unreadByChatId[chatId] && !chatOpenByOrderId[ord.id];
+
                                     return (
                                         <div key={ord.id} className="card">
                                             <div className="card__inner">
@@ -830,10 +851,10 @@ export default function CourierAppHome() {
                               2 · PICKED UP
                             </span>
                                                         <span className="pill pill--muted">3 · DELIVERED</span>
-                                                        <span className={`pill ${readyText === "READY" ? "pill--success" : "pill--muted"}`}>
-  Ready in {readyText}
-</span>
 
+                                                        <span className={`pill ${readyText === "READY" ? "pill--success" : "pill--muted"}`}>
+                              Ready in {readyText}
+                            </span>
                                                     </div>
                                                 </div>
 
@@ -924,10 +945,27 @@ export default function CourierAppHome() {
                                                         </a>
                                                     )}
 
-                                                    <button className="btn btn--ghost" onClick={() => toggleChat(ord.id)}>
-                                                        {chatOpenByOrderId[ord.id] ? "Hide chat" : "Chat"}
+                                                    <button
+                                                        className="btn btn--ghost"
+                                                        onClick={async () => {
+                                                            primeAudio();
+                                                            const willOpen = !chatOpenByOrderId[ord.id];
 
-                                                        {!!unreadByOrderId[ord.id] && !chatOpenByOrderId[ord.id] && (
+                                                            if (willOpen) {
+                                                                try {
+                                                                    await ensureChat(chatId, ord.id, String(ord.restaurantId ?? ""));
+                                                                    await markChatRead(chatId);
+                                                                } catch (e: any) {
+                                                                    setErr(e?.message ?? "Failed to open chat");
+                                                                    return;
+                                                                }
+                                                            }
+
+                                                            toggleChat(ord.id);
+                                                        }}
+                                                    >
+                                                        {chatOpenByOrderId[ord.id] ? "Hide chat" : "Chat"}
+                                                        {hasUnread && (
                                                             <span
                                                                 style={{
                                                                     display: "inline-block",
@@ -940,19 +978,18 @@ export default function CourierAppHome() {
                                                             />
                                                         )}
                                                     </button>
-
-
-                                                    {chatOpenByOrderId[ord.id] && (
-                                                        <OrderChat
-                                                            chatId={`${ord.id}_${user.uid}`}
-                                                            orderId={ord.id}
-                                                            restaurantId={String(ord.restaurantId ?? "")}
-                                                            courierId={user.uid}
-                                                            myRole="courier"
-                                                            disabled={ord.status === "cancelled"}
-                                                        />
-                                                    )}
                                                 </div>
+
+                                                {chatOpenByOrderId[ord.id] && (
+                                                    <OrderChat
+                                                        chatId={chatId}
+                                                        orderId={ord.id}
+                                                        restaurantId={String(ord.restaurantId ?? "")}
+                                                        courierId={user.uid}
+                                                        myRole="courier"
+                                                        disabled={ord.status === "cancelled"}
+                                                    />
+                                                )}
 
                                                 {!canDeliver && (
                                                     <div className="muted" style={{ marginTop: 10, fontSize: 13 }}>
@@ -968,7 +1005,6 @@ export default function CourierAppHome() {
 
                         {/* Offers */}
                         <div style={{ height: 12 }} />
-
                         <div className="card">
                             <div className="card__inner">
                                 <div className="row row--between row--wrap">
@@ -982,9 +1018,7 @@ export default function CourierAppHome() {
                   </span>
 
                                     {reachedMaxActive && (
-                                        <span className="pill pill--warning">
-                      Max {MAX_ACTIVE_ORDERS} active orders reached
-                    </span>
+                                        <span className="pill pill--warning">Max {MAX_ACTIVE_ORDERS} active orders reached</span>
                                     )}
                                 </div>
 
@@ -994,15 +1028,15 @@ export default function CourierAppHome() {
 
                                 <div className="stack">
                                     {offers.map((o) => {
-                                        const pickupMain = wazeUrl(o.pickupLat, o.pickupLng) ?? googleMapsUrl(o.pickupLat, o.pickupLng);
+                                        const pickupMain =
+                                            wazeUrl(o.pickupLat, o.pickupLng) ?? googleMapsUrl(o.pickupLat, o.pickupLng);
                                         const pickupYandex = yandexMapsUrl(o.pickupLat, o.pickupLng);
 
                                         const isBusy = busyOfferId === o.id;
 
                                         const offerCode =
-                                            typeof o.shortCode === "string" && o.shortCode
-                                                ? o.shortCode
-                                                : shortId(o.orderId);
+                                            typeof o.shortCode === "string" && o.shortCode ? o.shortCode : shortId(o.orderId);
+
                                         const readyText = readyInText(o.readyAtMs, nowMs);
 
                                         return (
@@ -1018,10 +1052,10 @@ export default function CourierAppHome() {
                             </span>
 
                                                         <span className="pill pill--success">Fee {money(o.deliveryFee)}</span>
-                                                        <span className={`pill ${readyText === "READY" ? "pill--success" : "pill--muted"}`}>
-  Ready in {readyText}
-</span>
 
+                                                        <span className={`pill ${readyText === "READY" ? "pill--success" : "pill--muted"}`}>
+                              Ready in {readyText}
+                            </span>
                                                     </div>
 
                                                     {pickupMain && (
@@ -1073,19 +1107,11 @@ export default function CourierAppHome() {
                                                 <div style={{ height: 12 }} />
 
                                                 <div className="row row--wrap row--mobile-stack">
-                                                    <button
-                                                        className="btn btn--success"
-                                                        onClick={() => acceptOffer(o)}
-                                                        disabled={isBusy || reachedMaxActive}
-                                                    >
+                                                    <button className="btn btn--success" onClick={() => acceptOffer(o)} disabled={isBusy || reachedMaxActive}>
                                                         {isBusy ? "Working…" : "Accept"}
                                                     </button>
 
-                                                    <button
-                                                        className="btn btn--danger"
-                                                        onClick={() => declineOffer(o.id)}
-                                                        disabled={isBusy}
-                                                    >
+                                                    <button className="btn btn--danger" onClick={() => declineOffer(o.id)} disabled={isBusy}>
                                                         {isBusy ? "Working…" : "Decline"}
                                                     </button>
                                                 </div>
@@ -1121,9 +1147,7 @@ export default function CourierAppHome() {
                                 <div className="stack">
                                     {completedOrders.map((o: any) => {
                                         const code =
-                                            typeof o?.shortCode === "string" && o.shortCode
-                                                ? o.shortCode
-                                                : shortId(o.id);
+                                            typeof o?.shortCode === "string" && o.shortCode ? o.shortCode : shortId(o.id);
 
                                         return (
                                             <div key={o.id} className="subcard">

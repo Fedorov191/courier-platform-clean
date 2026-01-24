@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { auth, db } from "../lib/firebase";
 import {
     addDoc,
@@ -10,18 +10,10 @@ import {
     query,
     serverTimestamp,
     setDoc,
-    updateDoc,
+    Timestamp,
 } from "firebase/firestore";
 
 type Role = "courier" | "restaurant";
-
-type MessageDoc = {
-    id: string;
-    text: string;
-    senderId: string;
-    senderRole: Role;
-    createdAt?: any; // Firestore Timestamp
-};
 
 type Props = {
     chatId: string;
@@ -32,35 +24,42 @@ type Props = {
     disabled?: boolean;
 };
 
-export function OrderChat({
-                              chatId,
-                              orderId,
-                              restaurantId,
-                              courierId,
-                              myRole,
-                              disabled,
-                          }: Props) {
-    const user = auth.currentUser;
+type Msg = {
+    id: string;
+    text: string;
+    senderId: string;
+    senderRole: Role;
+    createdAt?: Timestamp | null;
+};
 
-    const chatRef = useMemo(() => doc(db, "chats", chatId), [chatId]);
-    const messagesCol = useMemo(() => collection(db, "chats", chatId, "messages"), [chatId]);
+function fmt(ts?: Timestamp | null) {
+    if (!ts) return "";
+    return ts.toDate().toLocaleString();
+}
 
-    const [messages, setMessages] = useState<MessageDoc[]>([]);
+export function OrderChat(props: Props) {
+    const { chatId, orderId, restaurantId, courierId, myRole, disabled } = props;
+
+    const me = auth.currentUser?.uid ?? null;
+
     const [text, setText] = useState("");
     const [sending, setSending] = useState(false);
-    const [err, setErr] = useState<string | null>(null);
+    const [err, setErr] = useState<string>("");
+    const [messages, setMessages] = useState<Msg[]>([]);
+    const [chatReady, setChatReady] = useState(false);
 
-    // чтобы не спамить lastReadAt на каждый снапшот
-    const lastMarkedReadMsgIdRef = useRef<string | null>(null);
+    const chatRef = useMemo(() => doc(db, "chats", chatId), [chatId]);
+    const msgsCol = useMemo(() => collection(db, "chats", chatId, "messages"), [chatId]);
 
-    const readField = myRole === "courier" ? "lastReadAtCourier" : "lastReadAtRestaurant";
-
-    // 1) ensure chat doc exists (и содержит orderId/restaurantId/courierId)
+    // 1) ENSURE chat doc exists FIRST (иначе messages listener может упасть с PERMISSION_DENIED)
     useEffect(() => {
         let cancelled = false;
 
         async function ensureChat() {
-            if (!user) return;
+            setErr("");
+            setChatReady(false);
+
+            if (!me) return;
 
             try {
                 await setDoc(
@@ -70,17 +69,25 @@ export function OrderChat({
                         restaurantId,
                         courierId,
                         updatedAt: serverTimestamp(),
+                        createdAt: serverTimestamp(),
 
-                        // мета (может быть null у старых чатов — ок)
-                        lastMessageAt: null,
-                        lastMessageSenderId: null,
-                        lastReadAtCourier: null,
-                        lastReadAtRestaurant: null,
+                        ...(myRole === "restaurant"
+                            ? { lastReadAtRestaurant: serverTimestamp() }
+                            : {
+                                lastReadAtCourier: serverTimestamp(),
+                                // совместимость, если где-то оставалось старое поле
+                                courierLastReadAt: serverTimestamp(),
+                            }),
                     },
                     { merge: true }
                 );
+
+                if (!cancelled) setChatReady(true);
             } catch (e: any) {
-                if (!cancelled) setErr(e?.message ?? "Failed to init chat");
+                if (!cancelled) {
+                    setErr(e?.message ?? "Failed to init chat");
+                    setChatReady(false);
+                }
             }
         }
 
@@ -88,84 +95,90 @@ export function OrderChat({
         return () => {
             cancelled = true;
         };
-    }, [user, chatRef, orderId, restaurantId, courierId]);
+    }, [chatRef, me, orderId, restaurantId, courierId, myRole]);
 
-    // 2) subscribe to messages
+    // 2) realtime messages (только когда chatReady = true)
     useEffect(() => {
-        if (!user) return;
+        if (!chatReady) return;
 
-        const q = query(messagesCol, orderBy("createdAt", "asc"), limit(200));
+        setErr("");
+
+        const q = query(msgsCol, orderBy("createdAt", "asc"), limit(200));
 
         const unsub = onSnapshot(
             q,
             (snap) => {
-                const list: MessageDoc[] = snap.docs.map((d) => {
+                const list: Msg[] = snap.docs.map((d) => {
                     const data: any = d.data();
                     return {
                         id: d.id,
                         text: String(data.text ?? ""),
                         senderId: String(data.senderId ?? ""),
                         senderRole: (data.senderRole ?? "courier") as Role,
-                        createdAt: data.createdAt,
+                        createdAt: data.createdAt ?? null,
                     };
                 });
                 setMessages(list);
             },
-            (e: any) => setErr(e?.message ?? "Failed to load messages")
+            (e) => setErr(e?.message ?? "Chat load error")
         );
 
         return () => unsub();
-    }, [user, messagesCol]);
-
-    // 3) mark as read when chat is open and last message is from the other side
-    useEffect(() => {
-        if (!user) return;
-        if (messages.length === 0) return;
-
-        const last = messages[messages.length - 1];
-        if (!last) return;
-
-        // если последнее сообщение моё — ничего не делаем
-        if (last.senderId === user.uid) return;
-
-        // анти-спам: если мы уже отмечали "прочитано" именно для этого msgId
-        if (lastMarkedReadMsgIdRef.current === last.id) return;
-        lastMarkedReadMsgIdRef.current = last.id;
-
-        updateDoc(chatRef, {
-            [readField]: serverTimestamp(),
-            updatedAt: serverTimestamp(),
-        }).catch(() => {});
-    }, [messages, user, chatRef, readField]);
+    }, [chatReady, msgsCol]);
 
     async function send() {
-        if (!user) return;
         if (disabled) return;
+        if (!me) {
+            setErr("Not authorized");
+            return;
+        }
 
         const t = text.trim();
         if (!t) return;
 
-        setErr(null);
         setSending(true);
+        setErr("");
 
         try {
-            // messages правила: строго эти 4 поля
-            await addDoc(messagesCol, {
+            // (на всякий) ensure chat doc
+            await setDoc(
+                chatRef,
+                {
+                    orderId,
+                    restaurantId,
+                    courierId,
+                    updatedAt: serverTimestamp(),
+                    createdAt: serverTimestamp(),
+                },
+                { merge: true }
+            );
+
+            // add message
+            await addDoc(msgsCol, {
                 text: t,
-                senderId: user.uid,
+                senderId: me,
                 senderRole: myRole,
                 createdAt: serverTimestamp(),
             });
 
-            // мета чата (для unread + звука)
-            await updateDoc(chatRef, {
-                lastMessageAt: serverTimestamp(),
-                lastMessageSenderId: user.uid,
-                updatedAt: serverTimestamp(),
+            // update chat meta => для badges/beeps
+            await setDoc(
+                chatRef,
+                {
+                    lastMessageAt: serverTimestamp(),
+                    lastMessageSenderId: me,
+                    lastMessageSenderRole: myRole,
+                    updatedAt: serverTimestamp(),
 
-                // отправитель точно прочитал своё сообщение
-                [readField]: serverTimestamp(),
-            });
+                    ...(myRole === "restaurant"
+                        ? { lastReadAtRestaurant: serverTimestamp() }
+                        : {
+                            lastReadAtCourier: serverTimestamp(),
+                            courierLastReadAt: serverTimestamp(),
+                        }),
+                },
+                { merge: true }
+            );
 
             setText("");
         } catch (e: any) {
@@ -176,51 +189,26 @@ export function OrderChat({
     }
 
     return (
-        <div className="subcard" style={{ marginTop: 10 }}>
-            <div className="row row--between row--wrap" style={{ alignItems: "baseline" }}>
-                <b>Chat</b>
-                <span className="muted" style={{ fontSize: 12 }}>
-          {myRole.toUpperCase()}
-        </span>
-            </div>
+        <div className="subcard" style={{ marginTop: 12 }}>
+            <div style={{ fontWeight: 900, marginBottom: 8 }}>Chat</div>
 
-            <div className="hr" />
+            {err && (
+                <div className="alert alert--danger" style={{ marginBottom: 10 }}>
+                    {err}
+                </div>
+            )}
 
-            {err && <div className="alert alert--danger">{err}</div>}
-
-            <div
-                style={{
-                    maxHeight: 220,
-                    overflow: "auto",
-                    display: "grid",
-                    gap: 8,
-                    padding: 6,
-                }}
-            >
+            <div className="stack" style={{ gap: 8 }}>
                 {messages.length === 0 && <div className="muted">No messages yet.</div>}
 
-                {messages.map((m) => {
-                    const mine = user && m.senderId === user.uid;
-
-                    return (
-                        <div
-                            key={m.id}
-                            style={{
-                                justifySelf: mine ? "end" : "start",
-                                maxWidth: "85%",
-                                padding: "8px 10px",
-                                borderRadius: 10,
-                                border: "1px solid #333",
-                                background: mine ? "rgba(255,255,255,0.06)" : "rgba(0,0,0,0.15)",
-                            }}
-                        >
-                            <div style={{ fontSize: 12, opacity: 0.8, marginBottom: 4 }}>
-                                {mine ? "You" : m.senderRole}
-                            </div>
-                            <div style={{ whiteSpace: "pre-wrap" }}>{m.text}</div>
+                {messages.map((m) => (
+                    <div key={m.id} className="subcard">
+                        <div className="muted" style={{ fontSize: 12, marginBottom: 6 }}>
+                            {m.senderRole} · {fmt(m.createdAt)}
                         </div>
-                    );
-                })}
+                        <div>{m.text}</div>
+                    </div>
+                ))}
             </div>
 
             <div style={{ height: 10 }} />
@@ -229,27 +217,18 @@ export function OrderChat({
                 <input
                     value={text}
                     onChange={(e) => setText(e.target.value)}
-                    placeholder={disabled ? "Chat disabled" : "Type a message…"}
-                    disabled={!!disabled || sending}
-                    style={{
-                        flex: 1,
-                        minWidth: 220,
-                        padding: 10,
-                        borderRadius: 10,
-                        border: "1px solid #333",
-                        outline: "none",
-                    }}
-                    onKeyDown={(e) => {
-                        if (e.key === "Enter") {
-                            e.preventDefault();
-                            send();
-                        }
-                    }}
+                    placeholder="Type message..."
+                    disabled={disabled || sending}
+                    style={{ flex: 1, minWidth: 240 }}
                 />
 
-                <button className="btn btn--primary" onClick={send} disabled={!!disabled || sending}>
-                    {sending ? "Sending…" : "Send"}
+                <button className="btn btn--primary" onClick={send} disabled={disabled || sending || !text.trim()}>
+                    {sending ? "Sending..." : "Send"}
                 </button>
+            </div>
+
+            <div className="muted" style={{ marginTop: 8, fontSize: 12 }}>
+                Sound/NEW badge works when the other side sends a message and chat is closed.
             </div>
         </div>
     );

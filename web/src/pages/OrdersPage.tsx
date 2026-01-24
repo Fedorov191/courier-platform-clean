@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { onAuthStateChanged } from "firebase/auth";
 import { OrderChat } from "../components/OrderChat";
 
@@ -111,17 +111,17 @@ export function OrdersPage() {
 
     const [orders, setOrders] = useState<OrderDoc[]>([]);
     const [error, setError] = useState<string>("");
+
     const [tab, setTab] = useState<"active" | "completed" | "cancelled">("active");
     const [busyAction, setBusyAction] = useState<string | null>(null);
+
     const [chatOpenByOrderId, setChatOpenByOrderId] = useState<Record<string, boolean>>({});
 
-    // ✅ unread badges for chats (по chatId, чтобы не было конфликтов если менялся courier)
+    // ✅ unread badges по chatId (chatId = `${orderId}_${courierId}`)
     const [unreadByChatId, setUnreadByChatId] = useState<Record<string, boolean>>({});
-
-    // чтобы бипать только на "новые" сообщения, а не на первый снапшот
     const chatLastMsgAtByChatIdRef = useRef<Record<string, number>>({});
 
-    // чтобы в onSnapshot видеть актуально открытые чаты (без ресабскрайба)
+    // чтобы в onSnapshot видеть актуально открытые чаты
     const chatOpenRef = useRef(chatOpenByOrderId);
     useEffect(() => {
         chatOpenRef.current = chatOpenByOrderId;
@@ -137,7 +137,6 @@ export function OrdersPage() {
         if (!A) return;
 
         if (!audioCtxRef.current) audioCtxRef.current = new A();
-
         if (audioCtxRef.current.state === "suspended") {
             audioCtxRef.current.resume().catch(() => {});
         }
@@ -156,7 +155,7 @@ export function OrdersPage() {
         const gain = ctx.createGain();
 
         osc.type = "sine";
-        osc.frequency.value = 660; // отличаем от оффер-бипа
+        osc.frequency.value = 660;
         gain.gain.value = 0.06;
 
         osc.connect(gain);
@@ -167,6 +166,13 @@ export function OrdersPage() {
         osc.stop(t0 + 0.06);
     }
 
+    // ✅ первый user gesture -> разрешаем аудио
+    useEffect(() => {
+        const handler = () => primeAudio();
+        window.addEventListener("pointerdown", handler, { once: true });
+        return () => window.removeEventListener("pointerdown", handler);
+    }, []);
+
     function toggleChat(orderId: string) {
         setChatOpenByOrderId((prev) => ({ ...prev, [orderId]: !prev[orderId] }));
     }
@@ -176,14 +182,7 @@ export function OrdersPage() {
         return () => unsub();
     }, []);
 
-    // ✅ первый user gesture -> разрешаем аудио
-    useEffect(() => {
-        const handler = () => primeAudio();
-        window.addEventListener("pointerdown", handler, { once: true });
-        return () => window.removeEventListener("pointerdown", handler);
-    }, []);
-
-    // ✅ только UI подписка на заказы ресторана
+    // ✅ UI подписка на заказы ресторана
     useEffect(() => {
         setError("");
         setOrders([]);
@@ -260,7 +259,18 @@ export function OrdersPage() {
         return () => unsub();
     }, [uid]);
 
-    // ✅ subscribe to chats (restaurant) => unread + beep
+    const markChatRead = useCallback(async (chatId: string) => {
+        try {
+            await updateDoc(doc(db, "chats", chatId), {
+                restaurantLastReadAt: serverTimestamp(),
+                // совместимость со старым названием
+                lastReadAtRestaurant: serverTimestamp(),
+                updatedAt: serverTimestamp(),
+            });
+        } catch {}
+    }, []);
+
+    // ✅ подписка на чаты => unread + beep
     useEffect(() => {
         if (!uid) return;
 
@@ -273,30 +283,41 @@ export function OrdersPage() {
 
                 for (const d of snap.docs) {
                     const data: any = d.data();
-
                     const chatId = d.id;
+
                     const orderId = String(data.orderId ?? "");
                     if (!orderId) continue;
 
                     const lastAtMs = data.lastMessageAt?.toMillis?.() ?? 0;
                     const lastSenderId = String(data.lastMessageSenderId ?? "");
-                    const readAtMs = data.lastReadAtRestaurant?.toMillis?.() ?? 0;
+
+                    const readAtMs =
+                        (data.restaurantLastReadAt ?? data.lastReadAtRestaurant)?.toMillis?.() ?? 0;
 
                     const isUnread = lastAtMs > readAtMs && lastSenderId && lastSenderId !== uid;
-                    if (typeof isUnread === "boolean") {
-                        nextUnread[chatId] = isUnread;
-                    }
+                    nextUnread[chatId] = !!isUnread;
 
                     const prevMs = chatLastMsgAtByChatIdRef.current[chatId];
 
+                    // 1) первый снапшот — не бипаем
                     if (typeof prevMs !== "number") {
                         chatLastMsgAtByChatIdRef.current[chatId] = lastAtMs;
-                    } else if (lastAtMs > prevMs) {
+                        continue;
+                    }
+
+                    // 2) новое сообщение
+                    if (lastAtMs > prevMs) {
                         chatLastMsgAtByChatIdRef.current[chatId] = lastAtMs;
 
-                        const isChatClosed = !chatOpenRef.current[orderId];
-                        if (lastSenderId && lastSenderId !== uid && isChatClosed) {
-                            playChatBeep();
+                        const isChatOpen = !!chatOpenRef.current[orderId];
+
+                        if (lastSenderId && lastSenderId !== uid) {
+                            if (!isChatOpen) {
+                                playChatBeep();
+                            } else {
+                                // чат открыт — считаем прочитанным сразу
+                                markChatRead(chatId);
+                            }
                         }
                     }
                 }
@@ -307,7 +328,7 @@ export function OrdersPage() {
         );
 
         return () => unsub();
-    }, [uid]);
+    }, [uid, markChatRead]);
 
     const stats = useMemo(() => {
         const total = orders.length;
@@ -384,15 +405,6 @@ export function OrdersPage() {
         }
     }
 
-    async function markChatRead(chatId: string) {
-        try {
-            await updateDoc(doc(db, "chats", chatId), {
-                lastReadAtRestaurant: serverTimestamp(),
-                updatedAt: serverTimestamp(),
-            });
-        } catch {}
-    }
-
     if (!uid) {
         return (
             <div className="card">
@@ -411,6 +423,7 @@ export function OrdersPage() {
             <div className="row row--between row--wrap row--mobile-stack">
                 <div>
                     <h2 style={{ margin: 0 }}>Orders</h2>
+
                     <div className="row row--wrap" style={{ marginTop: 8 }}>
                         <div className="row row--wrap" style={{ marginTop: 10 }}>
                             <button
@@ -475,12 +488,12 @@ export function OrdersPage() {
                                     </div>
 
                                     <div className="row row--wrap">
-                                        <span className={`pill pill--${paymentTone(o.paymentType)}`}>
-                                            {paymentLabel(o.paymentType)}
-                                        </span>
+                    <span className={`pill pill--${paymentTone(o.paymentType)}`}>
+                      {paymentLabel(o.paymentType)}
+                    </span>
                                         <span className={`pill pill--${statusTone(o.status)}`}>
-                                            {statusLabel(o.status)}
-                                        </span>
+                      {statusLabel(o.status)}
+                    </span>
                                     </div>
                                 </div>
 
@@ -495,7 +508,9 @@ export function OrdersPage() {
 
                                         <div className="line" style={{ alignItems: "baseline" }}>
                                             <span>Address</span>
-                                            <b style={{ textAlign: "right" }}>{o.customerAddress || "—"}</b>
+                                            <b style={{ textAlign: "right" }}>
+                                                {o.dropoffAddressText ?? o.customerAddress ?? "—"}
+                                            </b>
                                         </div>
 
                                         {o.customerPhone && (
@@ -610,8 +625,8 @@ export function OrdersPage() {
 
                                         {o.assignedCourierId && (
                                             <span className="pill pill--muted">
-                                                Courier: {(o.assignedCourierId || "").slice(0, 6).toUpperCase()}
-                                            </span>
+                        Courier: {(o.assignedCourierId || "").slice(0, 6).toUpperCase()}
+                      </span>
                                         )}
                                     </div>
                                 )}
