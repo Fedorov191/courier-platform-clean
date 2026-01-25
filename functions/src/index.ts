@@ -197,7 +197,7 @@ export const getRouteQuote = onCall(
             durationSeconds,
             deliveryFee: fee,
             currency: "ILS",
-            pricingVersion: "v1",
+            pricingVersion: "v1_routes_api_2026_01",
         };
     }
 );
@@ -335,6 +335,32 @@ async function dispatchOrder(orderId: string, reason: string) {
                     ? deliveryDistanceMeters / 1000
                     : null;
 
+        // ✅ prep aliases (чтобы совпадать с промптом и не ломать текущее)
+        const prepMinutes =
+            typeof o.prepMinutes === "number"
+                ? o.prepMinutes
+                : typeof o.prepTimeMin === "number"
+                    ? o.prepTimeMin
+                    : null;
+
+        const createdAtMs = typeof o.createdAt?.toMillis === "function" ? o.createdAt.toMillis() : null;
+
+        const readyAtMs =
+            typeof o.readyAtMs === "number"
+                ? o.readyAtMs
+                : typeof o.readyAt?.toMillis === "function"
+                    ? o.readyAt.toMillis()
+                    : createdAtMs !== null && typeof prepMinutes === "number"
+                        ? createdAtMs + prepMinutes * 60_000
+                        : null;
+
+        const readyAt =
+            typeof o.readyAt?.toMillis === "function"
+                ? o.readyAt
+                : typeof readyAtMs === "number"
+                    ? Timestamp.fromMillis(readyAtMs)
+                    : null;
+
         tx.set(offerRef, {
             restaurantId: o.restaurantId ?? null,
             courierId,
@@ -348,6 +374,7 @@ async function dispatchOrder(orderId: string, reason: string) {
             pickupLng: o.pickupLng ?? null,
             pickupGeohash: o.pickupGeohash ?? null,
             pickupAddressText: o.pickupAddressText ?? null,
+            pickupPlaceId: o.pickupPlaceId ?? null,
 
             customerName: o.customerName ?? null,
             customerPhone: o.customerPhone ?? null,
@@ -357,6 +384,7 @@ async function dispatchOrder(orderId: string, reason: string) {
             dropoffLng: o.dropoffLng ?? null,
             dropoffGeohash: o.dropoffGeohash ?? null,
             dropoffAddressText: o.dropoffAddressText ?? null,
+            dropoffPlaceId: o.dropoffPlaceId ?? null,
 
             // ✅ structured dropoff fields (F)
             dropoffStreet: o.dropoffStreet ?? null,
@@ -382,9 +410,12 @@ async function dispatchOrder(orderId: string, reason: string) {
             createdAt: FieldValue.serverTimestamp(),
             updatedAt: FieldValue.serverTimestamp(),
 
-            // ✅ prep time fields (B)
-            prepTimeMin: o.prepTimeMin ?? null,
-            readyAtMs: typeof o.readyAtMs === "number" ? o.readyAtMs : null,
+            // ✅ prep time fields (B) — старые + новые
+            prepTimeMin: typeof o.prepTimeMin === "number" ? o.prepTimeMin : prepMinutes ?? null,
+            readyAtMs: typeof readyAtMs === "number" ? readyAtMs : null,
+
+            prepMinutes: prepMinutes ?? null,
+            readyAt: readyAt ?? null,
 
             // ✅ distance fields (A)
             routeDistanceMeters: typeof o.routeDistanceMeters === "number" ? o.routeDistanceMeters : null,
@@ -416,6 +447,35 @@ async function dispatchOrder(orderId: string, reason: string) {
         });
     });
 }
+
+// ----------------------------
+// CHAT: update chat meta on new message
+// ----------------------------
+export const onChatMessageCreated = onDocumentCreated(
+    "chats/{chatId}/messages/{msgId}",
+    async (event) => {
+        const chatId = event.params.chatId;
+        const msg = event.data?.data() as any;
+        if (!chatId || !msg) return;
+
+        const text = typeof msg.text === "string" ? msg.text : "";
+        const senderId = typeof msg.senderId === "string" ? msg.senderId : null;
+        const senderRole = typeof msg.senderRole === "string" ? msg.senderRole : null;
+
+        const createdAt = msg.createdAt instanceof Timestamp ? msg.createdAt : FieldValue.serverTimestamp();
+
+        await db.collection("chats").doc(chatId).set(
+            {
+                lastMessageAt: createdAt,
+                lastMessageText: text.slice(0, 200),
+                lastMessageSenderId: senderId,
+                lastMessageSenderRole: senderRole,
+                updatedAt: FieldValue.serverTimestamp(),
+            },
+            { merge: true }
+        );
+    }
+);
 
 // ----------------------------
 // TRIGGERS

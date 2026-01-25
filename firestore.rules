@@ -163,20 +163,48 @@ service cloud.firestore {
     // ----------------------------
     match /chats/{chatId} {
       allow read: if isChatDocParticipant();
+
       allow create: if canCreateChat(chatId);
-      allow update: if isChatDocParticipant() && immutableChatFields();
+
+      // ✅ UPDATE: только read-receipts + updatedAt
+      allow update: if isChatDocParticipant()
+        && immutableChatFields()
+        && (
+          // ресторан может обновлять только свои readAt
+          (resource.data.restaurantId == request.auth.uid
+            && request.resource.data.diff(resource.data).affectedKeys()
+              .hasOnly(["restaurantLastReadAt", "lastReadAtRestaurant", "updatedAt"])
+          )
+          ||
+          // курьер может обновлять только свои readAt
+          (resource.data.courierId == request.auth.uid
+            && request.resource.data.diff(resource.data).affectedKeys()
+              .hasOnly(["courierLastReadAt", "lastReadAtCourier", "updatedAt"])
+          )
+        );
+
       allow delete: if false;
 
       match /messages/{msgId} {
         allow read: if isChatParticipant(chatId);
 
+        // ✅ CREATE message:
+        // - нельзя подделать senderRole
+        // - createdAt должен быть serverTimestamp (== request.time)
         allow create: if isChatParticipant(chatId)
           && request.resource.data.keys().hasOnly(["text", "senderId", "senderRole", "createdAt"])
           && request.resource.data.text is string
           && request.resource.data.text.size() > 0
           && request.resource.data.text.size() <= 1000
           && request.resource.data.senderId == request.auth.uid
-          && (request.resource.data.senderRole == "courier" || request.resource.data.senderRole == "restaurant");
+          && request.resource.data.createdAt == request.time
+          && (
+            (request.resource.data.senderRole == "restaurant"
+              && request.auth.uid == chatDoc(chatId).data.restaurantId)
+            ||
+            (request.resource.data.senderRole == "courier"
+              && request.auth.uid == chatDoc(chatId).data.courierId)
+          );
 
         allow update, delete: if false;
       }

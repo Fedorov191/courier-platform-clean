@@ -368,13 +368,14 @@ export default function CourierAppHome() {
                 restaurantId,
                 courierId: user.uid,
                 updatedAt: serverTimestamp(),
-                createdAt: serverTimestamp(),
+
                 lastReadAtCourier: serverTimestamp(),
                 courierLastReadAt: serverTimestamp(),
             },
             { merge: true }
         );
     }
+
 
     // ensure courier docs
     useEffect(() => {

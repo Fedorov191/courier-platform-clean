@@ -10,6 +10,7 @@ import {
     query,
     serverTimestamp,
     setDoc,
+    updateDoc,
     Timestamp,
 } from "firebase/firestore";
 
@@ -62,6 +63,7 @@ export function OrderChat(props: Props) {
             if (!me) return;
 
             try {
+                // ⚠️ ВАЖНО: НЕ пишем createdAt сюда, иначе update rules зарубят.
                 await setDoc(
                     chatRef,
                     {
@@ -69,14 +71,15 @@ export function OrderChat(props: Props) {
                         restaurantId,
                         courierId,
                         updatedAt: serverTimestamp(),
-                        createdAt: serverTimestamp(),
 
                         ...(myRole === "restaurant"
-                            ? { lastReadAtRestaurant: serverTimestamp() }
+                            ? {
+                                restaurantLastReadAt: serverTimestamp(),
+                                lastReadAtRestaurant: serverTimestamp(), // compat
+                            }
                             : {
-                                lastReadAtCourier: serverTimestamp(),
-                                // совместимость, если где-то оставалось старое поле
                                 courierLastReadAt: serverTimestamp(),
+                                lastReadAtCourier: serverTimestamp(), // compat
                             }),
                     },
                     { merge: true }
@@ -126,12 +129,34 @@ export function OrderChat(props: Props) {
         return () => unsub();
     }, [chatReady, msgsCol]);
 
+    // 3) mark read (только свои read receipt поля)
+    async function markRead() {
+        try {
+            if (myRole === "restaurant") {
+                await updateDoc(chatRef, {
+                    restaurantLastReadAt: serverTimestamp(),
+                    lastReadAtRestaurant: serverTimestamp(),
+                    updatedAt: serverTimestamp(),
+                });
+            } else {
+                await updateDoc(chatRef, {
+                    courierLastReadAt: serverTimestamp(),
+                    lastReadAtCourier: serverTimestamp(),
+                    updatedAt: serverTimestamp(),
+                });
+            }
+        } catch {
+            // не ломаем UI
+        }
+    }
+
     async function send() {
         if (disabled) return;
         if (!me) {
             setErr("Not authorized");
             return;
         }
+        if (!chatReady) return;
 
         const t = text.trim();
         if (!t) return;
@@ -140,19 +165,6 @@ export function OrderChat(props: Props) {
         setErr("");
 
         try {
-            // (на всякий) ensure chat doc
-            await setDoc(
-                chatRef,
-                {
-                    orderId,
-                    restaurantId,
-                    courierId,
-                    updatedAt: serverTimestamp(),
-                    createdAt: serverTimestamp(),
-                },
-                { merge: true }
-            );
-
             // add message
             await addDoc(msgsCol, {
                 text: t,
@@ -161,24 +173,8 @@ export function OrderChat(props: Props) {
                 createdAt: serverTimestamp(),
             });
 
-            // update chat meta => для badges/beeps
-            await setDoc(
-                chatRef,
-                {
-                    lastMessageAt: serverTimestamp(),
-                    lastMessageSenderId: me,
-                    lastMessageSenderRole: myRole,
-                    updatedAt: serverTimestamp(),
-
-                    ...(myRole === "restaurant"
-                        ? { lastReadAtRestaurant: serverTimestamp() }
-                        : {
-                            lastReadAtCourier: serverTimestamp(),
-                            courierLastReadAt: serverTimestamp(),
-                        }),
-                },
-                { merge: true }
-            );
+            // отметим как прочитанное сразу (это разрешено rules)
+            await markRead();
 
             setText("");
         } catch (e: any) {
@@ -218,17 +214,14 @@ export function OrderChat(props: Props) {
                     value={text}
                     onChange={(e) => setText(e.target.value)}
                     placeholder="Type message..."
-                    disabled={disabled || sending}
+                    disabled={disabled || sending || !chatReady}
                     style={{ flex: 1, minWidth: 240 }}
+                    onFocus={() => markRead()}
                 />
 
-                <button className="btn btn--primary" onClick={send} disabled={disabled || sending || !text.trim()}>
+                <button className="btn btn--primary" onClick={send} disabled={disabled || sending || !text.trim() || !chatReady}>
                     {sending ? "Sending..." : "Send"}
                 </button>
-            </div>
-
-            <div className="muted" style={{ marginTop: 8, fontSize: 12 }}>
-                Sound/NEW badge works when the other side sends a message and chat is closed.
             </div>
         </div>
     );
