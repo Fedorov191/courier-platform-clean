@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { auth, db } from "../lib/firebase";
 import { OrderChat } from "../components/OrderChat";
+import { enablePush } from "../lib/push";
 
 import {
     collection,
@@ -214,6 +215,21 @@ export default function CourierAppHome() {
 
     const [isOnline, setIsOnline] = useState(false);
     const [err, setErr] = useState<string | null>(null);
+    const [pushBusy, setPushBusy] = useState(false);
+    const [pushEnabled, setPushEnabled] = useState(() => Notification.permission === "granted");
+
+    const enableCourierPush = useCallback(async () => {
+        setErr(null);
+        setPushBusy(true);
+        try {
+            await enablePush("courier");
+            setPushEnabled(true);
+        } catch (e: any) {
+            setErr(e?.message ?? "Failed to enable notifications");
+        } finally {
+            setPushBusy(false);
+        }
+    }, []);
 
     const [offers, setOffers] = useState<Offer[]>([]);
     const [activeOrders, setActiveOrders] = useState<any[]>([]);
@@ -855,8 +871,17 @@ export default function CourierAppHome() {
 
                                 <button
                                     className="btn btn--success"
-                                    onClick={() => {
+                                    onClick={async () => {
                                         primeAudio();
+
+                                        // ✅ тут просим разрешение (user gesture) + сохраняем token
+                                        try {
+                                            await enablePush("courier");
+                                        } catch (e: any) {
+                                            // не блокируем онлайн — просто покажем ошибку (или console.warn)
+                                            setErr(e?.message ?? "Failed to enable notifications");
+                                        }
+
                                         setOnline(true);
                                     }}
                                     disabled={isOnline}
@@ -864,8 +889,17 @@ export default function CourierAppHome() {
                                     {t("courierGoOnline")}
                                 </button>
 
+
                                 <button className="btn" onClick={() => setOnline(false)} disabled={!isOnline || hasActive}>
                                     {t("courierGoOffline")}
+                                </button>
+                                <button
+                                    className={`btn ${pushEnabled ? "btn--ghost" : "btn--primary"}`}
+                                    onClick={enableCourierPush}
+                                    disabled={pushBusy || pushEnabled}
+                                    title="Enable push notifications"
+                                >
+                                    {pushBusy ? "..." : pushEnabled ? "Notifications enabled" : "Enable notifications"}
                                 </button>
 
                                 <button className="btn btn--ghost" onClick={() => nav("/courier/app/reports")}>

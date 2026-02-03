@@ -8,6 +8,10 @@ import { logger } from "firebase-functions";
 import { onCall, HttpsError } from "firebase-functions/v2/https";
 import { defineSecret } from "firebase-functions/params";
 
+// ✅ PUSH функции живут в отдельном файле functions/src/push.ts
+// ✅ Здесь только re-export (верхний уровень)
+export { notifyOfferCreated, notifyChatMessageCreated } from "./push";
+
 // ----------------------------
 // INIT
 // ----------------------------
@@ -335,7 +339,7 @@ async function dispatchOrder(orderId: string, reason: string) {
                     ? deliveryDistanceMeters / 1000
                     : null;
 
-        // ✅ prep aliases (чтобы совпадать с промптом и не ломать текущее)
+        // ✅ prep aliases
         const prepMinutes =
             typeof o.prepMinutes === "number"
                 ? o.prepMinutes
@@ -410,7 +414,7 @@ async function dispatchOrder(orderId: string, reason: string) {
             createdAt: FieldValue.serverTimestamp(),
             updatedAt: FieldValue.serverTimestamp(),
 
-            // ✅ prep time fields (B) — старые + новые
+            // ✅ prep time fields (B)
             prepTimeMin: typeof o.prepTimeMin === "number" ? o.prepTimeMin : prepMinutes ?? null,
             readyAtMs: typeof readyAtMs === "number" ? readyAtMs : null,
 
@@ -449,35 +453,6 @@ async function dispatchOrder(orderId: string, reason: string) {
 }
 
 // ----------------------------
-// CHAT: update chat meta on new message
-// ----------------------------
-export const onChatMessageCreated = onDocumentCreated(
-    "chats/{chatId}/messages/{msgId}",
-    async (event) => {
-        const chatId = event.params.chatId;
-        const msg = event.data?.data() as any;
-        if (!chatId || !msg) return;
-
-        const text = typeof msg.text === "string" ? msg.text : "";
-        const senderId = typeof msg.senderId === "string" ? msg.senderId : null;
-        const senderRole = typeof msg.senderRole === "string" ? msg.senderRole : null;
-
-        const createdAt = msg.createdAt instanceof Timestamp ? msg.createdAt : FieldValue.serverTimestamp();
-
-        await db.collection("chats").doc(chatId).set(
-            {
-                lastMessageAt: createdAt,
-                lastMessageText: text.slice(0, 200),
-                lastMessageSenderId: senderId,
-                lastMessageSenderRole: senderRole,
-                updatedAt: FieldValue.serverTimestamp(),
-            },
-            { merge: true }
-        );
-    }
-);
-
-// ----------------------------
 // TRIGGERS
 // ----------------------------
 
@@ -487,7 +462,6 @@ export const dispatchOnOrderCreate = onDocumentCreated("orders/{orderId}", async
     const data = event.data?.data() as any;
     if (!data) return;
 
-    // только если реально новый и не назначен
     if (!isOpenOrderStatus(data.status ?? "new")) return;
     if (data.assignedCourierId) return;
 
@@ -504,7 +478,6 @@ export const reofferOnDeclined = onDocumentUpdated("offers/{offerId}", async (ev
     const beforeStatus = String(before.status ?? "");
     const afterStatus = String(after.status ?? "");
 
-    // интересует только переход pending -> declined
     if (!(beforeStatus === "pending" && afterStatus === "declined")) return;
 
     const orderId = String(after.orderId ?? "");
@@ -512,7 +485,6 @@ export const reofferOnDeclined = onDocumentUpdated("offers/{offerId}", async (ev
 
     const orderRef = db.collection("orders").doc(orderId);
 
-    // чистим lock, если это был текущий оффер
     let shouldDispatch = false;
     await db.runTransaction(async (tx) => {
         const os = await tx.get(orderRef);
@@ -564,7 +536,6 @@ export const cancelOfferOnOrderClose = onDocumentUpdated("orders/{orderId}", asy
 
     const offerRef = db.collection("offers").doc(currentOfferId);
 
-    // отменяем оффер (если он еще pending)
     try {
         const offerSnap = await offerRef.get();
         if (offerSnap.exists) {
@@ -578,7 +549,6 @@ export const cancelOfferOnOrderClose = onDocumentUpdated("orders/{orderId}", asy
         }
     } catch {}
 
-    // чистим lock на order, чтобы не висело
     try {
         await db.collection("orders").doc(orderId).update({
             currentOfferId: null,
@@ -590,105 +560,110 @@ export const cancelOfferOnOrderClose = onDocumentUpdated("orders/{orderId}", asy
 });
 
 // 4) Scheduler: раз в минуту
-//    - помечаем просроченные offers как expired
-//    - и пытаемся раздать открытые заказы без активного оффера
-export const dispatchTick = onSchedule({ schedule: "every 1 minutes", timeZone: "Asia/Jerusalem" }, async () => {
-    const nowMs = Date.now();
+export const dispatchTick = onSchedule(
+    { schedule: "every 1 minutes", timeZone: "Asia/Jerusalem" },
+    async () => {
+        const nowMs = Date.now();
 
-    // 4.1) expire pending offers
-    try {
-        const expiredSnap = await db
-            .collection("offers")
-            .where("status", "==", "pending")
-            .where("expiresAtMs", "<=", nowMs)
-            .orderBy("expiresAtMs", "asc")
-            .limit(TICK_LIMIT)
-            .get();
+        // 4.1) expire pending offers
+        try {
+            const expiredSnap = await db
+                .collection("offers")
+                .where("status", "==", "pending")
+                .where("expiresAtMs", "<=", nowMs)
+                .orderBy("expiresAtMs", "asc")
+                .limit(TICK_LIMIT)
+                .get();
 
-        const toReoffer = new Set<string>();
+            const toReoffer = new Set<string>();
 
-        for (const docSnap of expiredSnap.docs) {
-            const offerId = docSnap.id;
-            const offer: any = docSnap.data();
+            for (const docSnap of expiredSnap.docs) {
+                const offerId = docSnap.id;
+                const offer: any = docSnap.data();
 
-            if (String(offer.status ?? "") !== "pending") continue;
+                if (String(offer.status ?? "") !== "pending") continue;
 
-            const orderId = String(offer.orderId ?? "");
-            if (!orderId) continue;
+                const orderId = String(offer.orderId ?? "");
+                if (!orderId) continue;
 
-            const offerRef = db.collection("offers").doc(offerId);
-            const orderRef = db.collection("orders").doc(orderId);
+                const offerRef = db.collection("offers").doc(offerId);
+                const orderRef = db.collection("orders").doc(orderId);
 
-            await db.runTransaction(async (tx) => {
-                const off = await tx.get(offerRef);
-                if (!off.exists) return;
+                await db.runTransaction(async (tx) => {
+                    const off = await tx.get(offerRef);
+                    if (!off.exists) return;
 
-                const offData: any = off.data();
-                if (String(offData.status ?? "") !== "pending") return;
+                    const offData: any = off.data();
+                    if (String(offData.status ?? "") !== "pending") return;
 
-                const exp = Number(offData.expiresAtMs ?? 0);
-                if (exp > nowMs) return;
+                    const exp = Number(offData.expiresAtMs ?? 0);
+                    if (exp > nowMs) return;
 
-                tx.update(offerRef, {
-                    status: "expired",
-                    updatedAt: FieldValue.serverTimestamp(),
-                });
-
-                const os = await tx.get(orderRef);
-                if (!os.exists) return;
-
-                const o: any = os.data();
-
-                if (o.currentOfferId === offerId && !o.assignedCourierId && isOpenOrderStatus(String(o.status ?? ""))) {
-                    tx.update(orderRef, {
-                        status: "new",
-                        currentOfferId: null,
-                        currentOfferCourierId: null,
-                        offerExpiresAtMs: null,
+                    tx.update(offerRef, {
+                        status: "expired",
                         updatedAt: FieldValue.serverTimestamp(),
                     });
-                }
+
+                    const os = await tx.get(orderRef);
+                    if (!os.exists) return;
+
+                    const o: any = os.data();
+
+                    if (
+                        o.currentOfferId === offerId &&
+                        !o.assignedCourierId &&
+                        isOpenOrderStatus(String(o.status ?? ""))
+                    ) {
+                        tx.update(orderRef, {
+                            status: "new",
+                            currentOfferId: null,
+                            currentOfferCourierId: null,
+                            offerExpiresAtMs: null,
+                            updatedAt: FieldValue.serverTimestamp(),
+                        });
+                    }
+                });
+
+                toReoffer.add(orderId);
+            }
+
+            for (const orderId of toReoffer) {
+                await dispatchOrder(orderId, "offer_timeout_tick");
+            }
+        } catch (e: any) {
+            logger.warn("dispatchTick: expire offers failed", {
+                error: e?.message ?? String(e),
             });
-
-            toReoffer.add(orderId);
+            return;
         }
 
-        for (const orderId of toReoffer) {
-            await dispatchOrder(orderId, "offer_timeout_tick");
+        // 4.2) try dispatch open orders without active offer
+        const openOrderIds: string[] = [];
+
+        try {
+            const q1 = await db
+                .collection("orders")
+                .where("assignedCourierId", "==", null)
+                .where("status", "==", "new")
+                .limit(TICK_LIMIT)
+                .get();
+            for (const d of q1.docs) openOrderIds.push(d.id);
+
+            const q2 = await db
+                .collection("orders")
+                .where("assignedCourierId", "==", null)
+                .where("status", "==", "offered")
+                .limit(TICK_LIMIT)
+                .get();
+            for (const d of q2.docs) openOrderIds.push(d.id);
+        } catch (e: any) {
+            logger.warn("dispatchTick: open orders query failed", { error: e?.message ?? String(e) });
         }
-    } catch (e: any) {
-        logger.warn("dispatchTick: expire offers failed", {
-            error: e?.message ?? String(e),
-        });
-        return; // критично: если expire упал — не создаём новые offers
+
+        const uniq = Array.from(new Set(openOrderIds)).slice(0, TICK_LIMIT);
+
+        for (const orderId of uniq) {
+            await dispatchOrder(orderId, "open_orders_tick");
+        }
     }
-
-    // 4.2) try dispatch open orders without active offer
-    const openOrderIds: string[] = [];
-
-    try {
-        const q1 = await db
-            .collection("orders")
-            .where("assignedCourierId", "==", null)
-            .where("status", "==", "new")
-            .limit(TICK_LIMIT)
-            .get();
-        for (const d of q1.docs) openOrderIds.push(d.id);
-
-        const q2 = await db
-            .collection("orders")
-            .where("assignedCourierId", "==", null)
-            .where("status", "==", "offered")
-            .limit(TICK_LIMIT)
-            .get();
-        for (const d of q2.docs) openOrderIds.push(d.id);
-    } catch (e: any) {
-        logger.warn("dispatchTick: open orders query failed", { error: e?.message ?? String(e) });
-    }
-
-    const uniq = Array.from(new Set(openOrderIds)).slice(0, TICK_LIMIT);
-
-    for (const orderId of uniq) {
-        await dispatchOrder(orderId, "open_orders_tick");
-    }
-});
+);

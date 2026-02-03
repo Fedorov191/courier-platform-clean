@@ -157,6 +157,13 @@ service cloud.firestore {
       allow read: if signedIn() && (isRestaurant() || (isCourier() && request.auth.uid == courierId));
       allow write: if signedIn() && isCourier() && request.auth.uid == courierId;
     }
+match /couriers/{courierId}/fcmTokens/{tokenId} {
+  allow read, write: if signedIn() && request.auth.uid == courierId;
+}
+
+match /restaurants/{restaurantId}/fcmTokens/{tokenId} {
+  allow read, write: if signedIn() && request.auth.uid == restaurantId;
+}
 
     // ----------------------------
     // Chats

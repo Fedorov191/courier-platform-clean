@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { onAuthStateChanged } from "firebase/auth";
 import { OrderChat } from "../components/OrderChat";
+import { enablePush } from "../lib/push";
 
 import {
     collection,
@@ -115,6 +116,21 @@ export function OrdersPage() {
 
     const [orders, setOrders] = useState<OrderDoc[]>([]);
     const [error, setError] = useState<string>("");
+    const [pushBusy, setPushBusy] = useState(false);
+    const [pushEnabled, setPushEnabled] = useState(() => Notification.permission === "granted");
+
+    const enableRestaurantPush = useCallback(async () => {
+        setError("");
+        setPushBusy(true);
+        try {
+            await enablePush("restaurant");
+            setPushEnabled(true);
+        } catch (e: any) {
+            setError(e?.message ?? "Failed to enable notifications");
+        } finally {
+            setPushBusy(false);
+        }
+    }, []);
 
     const [tab, setTab] = useState<"active" | "completed" | "cancelled">("active");
     const [busyAction, setBusyAction] = useState<string | null>(null);
@@ -501,9 +517,35 @@ export function OrdersPage() {
                     </div>
                 </div>
 
-                <button className="btn btn--primary" onClick={goNewOrder}>
-                    + {t("newOrder")}
-                </button>
+                <div className="row row--wrap" style={{ gap: 8, justifyContent: "flex-end" }}>
+                    <button
+                        className={`btn ${pushEnabled ? "btn--ghost" : "btn--primary"}`}
+                        onClick={enableRestaurantPush}
+                        disabled={pushBusy || pushEnabled}
+                        title="Enable push notifications"
+                    >
+                        {pushBusy ? "..." : pushEnabled ? "Notifications enabled" : "Enable notifications"}
+                    </button>
+                    <button
+                        className="btn btn--ghost"
+                        onClick={async () => {
+                            primeAudio();
+                            try {
+                                await enablePush("restaurant");
+                                alert("Notifications enabled");
+                            } catch (e: any) {
+                                alert(e?.message ?? "Failed to enable notifications");
+                            }
+                        }}
+                    >
+                        🔔
+                    </button>
+
+                    <button className="btn btn--primary" onClick={goNewOrder}>
+                        + {t("newOrder")}
+                    </button>
+                </div>
+
             </div>
 
             {loading && <div className="muted">{t("loading")}</div>}
