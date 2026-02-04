@@ -4,6 +4,7 @@ import { OrderChat } from "../components/OrderChat";
 import { enablePush } from "../lib/push";
 import { Capacitor } from "@capacitor/core";
 import { enableNativePush, initNativePushListeners } from "../lib/push.native";
+import { Geolocation } from "@capacitor/geolocation";
 
 import {
     collection,
@@ -131,6 +132,25 @@ function haversineMeters(lat1: number, lon1: number, lat2: number, lon2: number)
     const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
     return R * c;
 }
+async function ensureNativeGeolocationPermission(): Promise<boolean> {
+    if (!Capacitor.isNativePlatform()) return true;
+
+    try {
+        let perm = await Geolocation.checkPermissions();
+
+        // perm.location: 'prompt' | 'granted' | 'denied'
+        if (perm.location !== "granted") {
+            perm = await Geolocation.requestPermissions({ permissions: ["location"] });
+        }
+
+        return perm.location === "granted";
+    } catch (e: any) {
+        // checkPermissions/requestPermissions могут бросить ошибку,
+        // если system location services выключены (GPS off)
+        // docs: "Will throw if system location services are disabled." :contentReference[oaicite:3]{index=3}
+        return false;
+    }
+}
 
 function pillToneForOrderStatus(status?: string) {
     switch (status) {
@@ -198,7 +218,8 @@ export default function CourierAppHome() {
     const user = auth.currentUser;
     const { t } = useI18n();
 
-    const watchId = useRef<number | null>(null);
+    const watchId = useRef<string | number | null>(null);
+
     const heartbeatId = useRef<number | null>(null);
 
     const lastGeoWriteMsRef = useRef<number>(0);
@@ -626,9 +647,16 @@ export default function CourierAppHome() {
         }
 
         if (!next && watchId.current !== null) {
-            navigator.geolocation.clearWatch(watchId.current);
+            try {
+                if (Capacitor.isNativePlatform()) {
+                    await Geolocation.clearWatch({ id: String(watchId.current) });
+                } else {
+                    navigator.geolocation.clearWatch(Number(watchId.current));
+                }
+            } catch {}
             watchId.current = null;
         }
+
         if (!next && heartbeatId.current !== null) {
             window.clearInterval(heartbeatId.current);
             heartbeatId.current = null;
@@ -653,21 +681,37 @@ export default function CourierAppHome() {
             );
 
             setIsOnline(next);
-            if (next) startTracking();
+            if (next) await startTracking();
+
         } catch (e: any) {
             setErr(e?.message ?? t("courierErrorUpdateStatus"));
         }
     }
 
-    function startTracking() {
+    async function startTracking() {
         if (!courierPublicRef) return;
-        if (!navigator.geolocation) {
-            setErr(t("courierErrorGeoNotSupported"));
-            return;
+
+        // В нативке НЕ используем navigator.geolocation — только Capacitor Geolocation
+        const isNative = Capacitor.isNativePlatform();
+
+        // 0) чистим старые таймеры/вотчи (если были)
+        if (heartbeatId.current !== null) {
+            window.clearInterval(heartbeatId.current);
+            heartbeatId.current = null;
         }
 
-        if (heartbeatId.current !== null) window.clearInterval(heartbeatId.current);
+        if (watchId.current !== null) {
+            try {
+                if (isNative) {
+                    await Geolocation.clearWatch({ id: String(watchId.current) });
+                } else if (navigator.geolocation) {
+                    navigator.geolocation.clearWatch(Number(watchId.current));
+                }
+            } catch {}
+            watchId.current = null;
+        }
 
+        // 1) Heartbeat раз в минуту: пишет lastSeen/координаты если они есть
         heartbeatId.current = window.setInterval(async () => {
             try {
                 const now = Date.now();
@@ -700,6 +744,91 @@ export default function CourierAppHome() {
                 geoWriteInFlightRef.current = false;
             }
         }, GEO_WRITE_MIN_MS);
+
+        // 2) WatchPosition: разные реализации для Native и Web
+        if (isNative) {
+            // СНАЧАЛА запросим permission (иначе получишь "denied" без диалога)
+            let perm = await Geolocation.checkPermissions();
+            if (perm.location !== "granted") {
+                perm = await Geolocation.requestPermissions({ permissions: ["location"] });
+            }
+
+            if (perm.location !== "granted") {
+                setErr("Location permission is required. Enable it in Settings → Apps → Permissions → Location.");
+                return;
+            }
+
+            // Пробуем получить позицию сразу (чтобы поймать случай когда GPS выключен)
+            try {
+                const first = await Geolocation.getCurrentPosition({
+                    enableHighAccuracy: true,
+                    timeout: 10_000,
+                    maximumAge: 10_000,
+                });
+                lastGeoRef.current = { lat: first.coords.latitude, lng: first.coords.longitude };
+            } catch (e: any) {
+                setErr(e?.message ?? "Failed to get location. Turn on GPS / Location Services.");
+                return;
+            }
+
+            // Теперь ставим watch
+            const id = await Geolocation.watchPosition(
+                { enableHighAccuracy: true, timeout: 10_000, maximumAge: 10_000 },
+                async (pos, err) => {
+                    if (err) {
+                        setErr(err.message ?? "Geolocation error");
+                        return;
+                    }
+                    if (!pos) return;
+
+                    const { latitude, longitude } = pos.coords;
+
+                    const now = Date.now();
+                    const prev = lastGeoRef.current;
+                    const moved = prev ? haversineMeters(prev.lat, prev.lng, latitude, longitude) : Infinity;
+
+                    lastGeoRef.current = { lat: latitude, lng: longitude };
+
+                    const elapsed = now - lastGeoWriteMsRef.current;
+                    const shouldWrite = elapsed >= GEO_WRITE_MIN_MS || moved >= GEO_MIN_MOVE_M;
+                    if (!shouldWrite) return;
+
+                    if (geoWriteInFlightRef.current) return;
+                    geoWriteInFlightRef.current = true;
+
+                    try {
+                        const geohash = geohashForLocation([latitude, longitude]);
+
+                        await setDoc(
+                            courierPublicRef,
+                            {
+                                lat: latitude,
+                                lng: longitude,
+                                geohash,
+                                lastSeenAt: serverTimestamp(),
+                                updatedAt: serverTimestamp(),
+                            },
+                            { merge: true }
+                        );
+
+                        lastGeoWriteMsRef.current = now;
+                    } catch (e: any) {
+                        setErr(e?.message ?? t("courierErrorUpdateLocation"));
+                    } finally {
+                        geoWriteInFlightRef.current = false;
+                    }
+                }
+            );
+
+            watchId.current = id; // <-- string
+            return;
+        }
+
+        // WEB fallback (браузер)
+        if (!navigator.geolocation) {
+            setErr(t("courierErrorGeoNotSupported"));
+            return;
+        }
 
         watchId.current = navigator.geolocation.watchPosition(
             async (pos) => {
@@ -744,6 +873,7 @@ export default function CourierAppHome() {
             { enableHighAccuracy: true, maximumAge: 10_000, timeout: 10_000 }
         );
     }
+
 
     async function acceptOffer(offer: Offer) {
         if (!auth.currentUser) return;
@@ -894,11 +1024,21 @@ export default function CourierAppHome() {
                                     onClick={async () => {
                                         primeAudio();
 
-                                        // 1) В native (Capacitor) — запросить permission + получить token
+                                        // 0) Если это native build — сначала геолокация
+                                        if (Capacitor.isNativePlatform()) {
+                                            const okGeo = await ensureNativeGeolocationPermission();
+                                            if (!okGeo) {
+                                                setErr(
+                                                    "Geolocation is required. Please enable Location (GPS) and allow Location permission for the app."
+                                                );
+                                                return; // НЕ уходим online
+                                            }
+                                        }
+
+                                        // 1) Native push (Capacitor)
                                         try {
                                             if (Capacitor.isNativePlatform()) {
                                                 await enableNativePush("courier");
-                                                setPushEnabled(true);
                                             }
                                         } catch (e: any) {
                                             setErr(e?.message ?? "Failed to enable push notifications");
