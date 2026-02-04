@@ -22,3 +22,10 @@ pubsub-debug.log
 # Optional build outputs (если это генерится сборкой)
 functions/lib/
 web/dist/
+# Google / Firebase secrets
+google-services.json
+**/google-services.json
+
+serviceAccountKey.json
+firebase-adminsdk*.json
+**/firebase-adminsdk*.json

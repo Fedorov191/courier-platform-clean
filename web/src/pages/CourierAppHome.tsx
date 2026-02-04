@@ -2,6 +2,8 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { auth, db } from "../lib/firebase";
 import { OrderChat } from "../components/OrderChat";
 import { enablePush } from "../lib/push";
+import { Capacitor } from "@capacitor/core";
+import { enableNativePush, initNativePushListeners } from "../lib/push.native";
 
 import {
     collection,
@@ -216,13 +218,24 @@ export default function CourierAppHome() {
     const [isOnline, setIsOnline] = useState(false);
     const [err, setErr] = useState<string | null>(null);
     const [pushBusy, setPushBusy] = useState(false);
-    const [pushEnabled, setPushEnabled] = useState(() => Notification.permission === "granted");
+    const [pushEnabled, setPushEnabled] = useState<boolean>(() => {
+        // В Capacitor WebView Notification может отсутствовать
+        if (Capacitor.isNativePlatform()) return false;
+        return typeof Notification !== "undefined" && Notification.permission === "granted";
+    });
+
 
     const enableCourierPush = useCallback(async () => {
         setErr(null);
         setPushBusy(true);
+
         try {
-            await enablePush("courier");
+            if (Capacitor.isNativePlatform()) {
+                await enableNativePush("courier");
+            } else {
+                await enablePush("courier");
+            }
+
             setPushEnabled(true);
         } catch (e: any) {
             setErr(e?.message ?? "Failed to enable notifications");
@@ -230,6 +243,7 @@ export default function CourierAppHome() {
             setPushBusy(false);
         }
     }, []);
+
 
     const [offers, setOffers] = useState<Offer[]>([]);
     const [activeOrders, setActiveOrders] = useState<any[]>([]);
@@ -348,6 +362,12 @@ export default function CourierAppHome() {
         const handler = () => primeAudio();
         window.addEventListener("pointerdown", handler, { once: true });
         return () => window.removeEventListener("pointerdown", handler);
+    }, []);
+    useEffect(() => {
+        // в нативной сборке повесим listeners один раз
+        if (Capacitor.isNativePlatform()) {
+            initNativePushListeners().catch(() => {});
+        }
     }, []);
 
     // offers beep каждую секунду пока есть offers
@@ -874,20 +894,25 @@ export default function CourierAppHome() {
                                     onClick={async () => {
                                         primeAudio();
 
-                                        // ✅ тут просим разрешение (user gesture) + сохраняем token
+                                        // 1) В native (Capacitor) — запросить permission + получить token
                                         try {
-                                            await enablePush("courier");
+                                            if (Capacitor.isNativePlatform()) {
+                                                await enableNativePush("courier");
+                                                setPushEnabled(true);
+                                            }
                                         } catch (e: any) {
-                                            // не блокируем онлайн — просто покажем ошибку (или console.warn)
-                                            setErr(e?.message ?? "Failed to enable notifications");
+                                            setErr(e?.message ?? "Failed to enable push notifications");
+                                            return; // если пуши не включились — НЕ уходим online
                                         }
 
-                                        setOnline(true);
+                                        // 2) теперь можно online
+                                        await setOnline(true);
                                     }}
                                     disabled={isOnline}
                                 >
                                     {t("courierGoOnline")}
                                 </button>
+
 
 
                                 <button className="btn" onClick={() => setOnline(false)} disabled={!isOnline || hasActive}>
