@@ -216,6 +216,8 @@ function formatDropoffParts(o: any) {
 export default function CourierAppHome() {
     const nav = useNavigate();
     const user = auth.currentUser;
+    const isNative = Capacitor.isNativePlatform();
+
     const { t } = useI18n();
 
     const watchId = useRef<string | number | null>(null);
@@ -240,8 +242,7 @@ export default function CourierAppHome() {
     const [err, setErr] = useState<string | null>(null);
     const [pushBusy, setPushBusy] = useState(false);
     const [pushEnabled, setPushEnabled] = useState<boolean>(() => {
-        // В Capacitor WebView Notification может отсутствовать
-        if (Capacitor.isNativePlatform()) return false;
+        if (isNative) return false;
         return typeof Notification !== "undefined" && Notification.permission === "granted";
     });
 
@@ -1039,6 +1040,7 @@ export default function CourierAppHome() {
                                         try {
                                             if (Capacitor.isNativePlatform()) {
                                                 await enableNativePush("courier");
+                                                setPushEnabled(true);
                                             }
                                         } catch (e: any) {
                                             setErr(e?.message ?? "Failed to enable push notifications");
@@ -1058,14 +1060,16 @@ export default function CourierAppHome() {
                                 <button className="btn" onClick={() => setOnline(false)} disabled={!isOnline || hasActive}>
                                     {t("courierGoOffline")}
                                 </button>
-                                <button
-                                    className={`btn ${pushEnabled ? "btn--ghost" : "btn--primary"}`}
-                                    onClick={enableCourierPush}
-                                    disabled={pushBusy || pushEnabled}
-                                    title="Enable push notifications"
-                                >
-                                    {pushBusy ? "..." : pushEnabled ? "Notifications enabled" : "Enable notifications"}
-                                </button>
+                                {!isNative && (
+                                    <button
+                                        className={`btn ${pushEnabled ? "btn--ghost" : "btn--primary"}`}
+                                        onClick={enableCourierPush}
+                                        disabled={pushBusy || pushEnabled}
+                                        title="Enable push notifications"
+                                    >
+                                        {pushBusy ? "..." : pushEnabled ? "Notifications enabled" : "Enable notifications"}
+                                    </button>
+                                )}
 
                                 <button className="btn btn--ghost" onClick={() => nav("/courier/app/reports")}>
                                     {t("reports")}

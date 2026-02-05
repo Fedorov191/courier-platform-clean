@@ -47,14 +47,15 @@ async function removeBadTokens(scope: PushScope, uid: string, bad: string[]) {
     }
 }
 
-async function sendPushToUser(scope: PushScope, uid: string, data: Record<string, string>) {
+type MessageWithoutTokens = Omit<admin.messaging.MulticastMessage, "tokens">;
+
+async function sendPushToUser(scope: PushScope, uid: string, message: MessageWithoutTokens) {
     const tokens = await getPushTokens(scope, uid);
     if (tokens.length === 0) return;
 
     const resp = await admin.messaging().sendEachForMulticast({
         tokens,
-        // ВАЖНО: только data, без notification (тогда SW стабильно обработает)
-        data,
+        ...message,
     });
 
     const bad: string[] = [];
@@ -104,15 +105,38 @@ export const notifyOfferCreated = onDocumentCreated(
 
         const title = "New offer";
         const body = feeTxt ? `#${code} • Fee ${feeTxt}` : `#${code}`;
-        const link = `${APP_BASE_URL}/courier/app`;
+
+        // ✅ для нативки лучше относительный путь (чтобы обрабатывать в native handler)
+        const link = "/courier/app";
 
         await sendPushToUser("courier", courierId, {
-            type: "offer",
-            title,
-            body,
-            link,
-            offerId: String(offerId),
-            orderId: String(orderId),
+            // ✅ оставляем data (не ломаем web/SW логику)
+            data: {
+                type: "offer",
+                title,
+                body,
+                link,
+                offerId: String(offerId),
+                orderId: String(orderId),
+            },
+
+            // ✅ Android: high + channel offers + sound offer
+            // Важно: канал "offers" должен быть создан на устройстве в нативном коде,
+            // а звук "offer" должен лежать в android/app/src/main/res/raw/offer.(mp3|wav|ogg)
+            android: {
+                priority: "high",
+                notification: {
+                    title,
+                    body,
+                    channelId: "offers",
+                    sound: "offer",
+                },
+            },
+
+            // ✅ web может работать параллельно
+            webpush: {
+                fcmOptions: { link: `${APP_BASE_URL}/courier/app` },
+            },
         });
     }
 );
@@ -163,23 +187,29 @@ export const notifyChatMessageCreated = onDocumentCreated(
                 if (!restaurantId) return;
                 const link = `${APP_BASE_URL}/restaurant/app/orders`;
                 await sendPushToUser("restaurant", restaurantId, {
-                    type: "chat",
-                    title,
-                    body,
-                    link,
-                    chatId: String(chatId),
-                    orderId: String(orderId),
+                    // оставляем data-only как было
+                    data: {
+                        type: "chat",
+                        title,
+                        body,
+                        link,
+                        chatId: String(chatId),
+                        orderId: String(orderId),
+                    },
                 });
             } else if (senderRole === "restaurant") {
                 if (!courierId) return;
                 const link = `${APP_BASE_URL}/courier/app`;
                 await sendPushToUser("courier", courierId, {
-                    type: "chat",
-                    title,
-                    body,
-                    link,
-                    chatId: String(chatId),
-                    orderId: String(orderId),
+                    // оставляем data-only как было
+                    data: {
+                        type: "chat",
+                        title,
+                        body,
+                        link,
+                        chatId: String(chatId),
+                        orderId: String(orderId),
+                    },
                 });
             }
         } catch (e: any) {
