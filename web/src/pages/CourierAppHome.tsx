@@ -5,6 +5,7 @@ import { enablePush } from "../lib/push";
 import { Capacitor } from "@capacitor/core";
 import { enableNativePush, initNativePushListeners } from "../lib/push.native";
 import { Geolocation } from "@capacitor/geolocation";
+import { CourierMapPanel } from "../components/courier/CourierMapPanel";
 
 import {
     collection,
@@ -226,6 +227,19 @@ export default function CourierAppHome() {
 
     const lastGeoWriteMsRef = useRef<number>(0);
     const lastGeoRef = useRef<{ lat: number; lng: number } | null>(null);
+    const [lastGeo, setLastGeo] = useState<{ lat: number; lng: number } | null>(null);
+    const lastGeoUiSetMsRef = useRef(0);
+
+    const updateLastGeoUi = useCallback((lat: number, lng: number) => {
+        lastGeoRef.current = { lat, lng };
+
+        const now = Date.now();
+        if (now - lastGeoUiSetMsRef.current < 1200) return; // UI throttling
+        lastGeoUiSetMsRef.current = now;
+
+        setLastGeo({ lat, lng });
+    }, []);
+
     const geoWriteInFlightRef = useRef(false);
 
     const courierPrivateRef = useMemo(() => {
@@ -268,6 +282,17 @@ export default function CourierAppHome() {
 
 
     const [offers, setOffers] = useState<Offer[]>([]);
+    const [selectedOfferId, setSelectedOfferId] = useState<string | null>(null);
+
+    useEffect(() => {
+        if (offers.length === 0) {
+            setSelectedOfferId(null);
+            return;
+        }
+        if (selectedOfferId && offers.some((o) => o.id === selectedOfferId)) return;
+        setSelectedOfferId(offers[0].id);
+    }, [offers, selectedOfferId]);
+
     const [activeOrders, setActiveOrders] = useState<any[]>([]);
     const [completedOrders, setCompletedOrders] = useState<any[]>([]);
     const [tab, setTab] = useState<"active" | "completed">("active");
@@ -831,7 +856,8 @@ export default function CourierAppHome() {
                     timeout: 10_000,
                     maximumAge: 10_000,
                 });
-                lastGeoRef.current = { lat: first.coords.latitude, lng: first.coords.longitude };
+                updateLastGeoUi(first.coords.latitude, first.coords.longitude);
+
             } catch (e: any) {
                 setErr(e?.message ?? "Failed to get location. Turn on GPS / Location Services.");
                 return;
@@ -853,7 +879,8 @@ export default function CourierAppHome() {
                     const prev = lastGeoRef.current;
                     const moved = prev ? haversineMeters(prev.lat, prev.lng, latitude, longitude) : Infinity;
 
-                    lastGeoRef.current = { lat: latitude, lng: longitude };
+                    updateLastGeoUi(latitude, longitude);
+
 
                     const elapsed = now - lastGeoWriteMsRef.current;
                     const shouldWrite = elapsed >= GEO_WRITE_MIN_MS || moved >= GEO_MIN_MOVE_M;
@@ -904,7 +931,8 @@ export default function CourierAppHome() {
                 const prev = lastGeoRef.current;
                 const moved = prev ? haversineMeters(prev.lat, prev.lng, latitude, longitude) : Infinity;
 
-                lastGeoRef.current = { lat: latitude, lng: longitude };
+                updateLastGeoUi(latitude, longitude);
+
 
                 const elapsed = now - lastGeoWriteMsRef.current;
                 const shouldWrite = elapsed >= GEO_WRITE_MIN_MS || moved >= GEO_MIN_MOVE_M;
@@ -1181,6 +1209,15 @@ export default function CourierAppHome() {
                 {tab === "active" && (
                     <>
                         <div style={{ height: 12 }} />
+                        <CourierMapPanel
+                            courier={lastGeo}
+                            offers={offers}
+                            activeOrders={activeOrders.slice(0, MAX_ACTIVE_ORDERS)}
+                            selectedOfferId={selectedOfferId}
+                            setSelectedOfferId={setSelectedOfferId}
+                        />
+
+                        <div style={{ height: 12 }} />
 
                         {/* Active orders */}
                         {activeOrders.length > 0 && (
@@ -1338,12 +1375,12 @@ export default function CourierAppHome() {
                                                     </button>
 
                                                     {canPickup && pickupMain && (
-                                                        <a className="btn btn--ghost" href={pickupMain} target="_blank" rel="noreferrer">
+                                                        <a className="btn btn--ghost" href={pickupMain} target="_blank" rel="noreferrer" onClick={(e) => e.stopPropagation()}>
                                                             {t("courierRouteToRestaurant")}
                                                         </a>
                                                     )}
                                                     {canPickup && pickupYandex && (
-                                                        <a className="btn btn--ghost" href={pickupYandex} target="_blank" rel="noreferrer">
+                                                        <a className="btn btn--ghost" href={pickupYandex} target="_blank" rel="noreferrer" onClick={(e) => e.stopPropagation()}>
                                                             {t("courierYandex")}
                                                         </a>
                                                     )}
@@ -1471,7 +1508,16 @@ export default function CourierAppHome() {
                                         const extra = dropoffExtra(drop.apt, drop.ent);
 
                                         return (
-                                            <div key={o.id} className="subcard">
+                                            <div
+                                                key={o.id}
+                                                className="subcard"
+                                                onClick={() => setSelectedOfferId(o.id)}
+                                                style={{
+                                                    cursor: "pointer",
+                                                    outline: o.id === selectedOfferId ? "2px solid #111" : "1px solid transparent",
+                                                    outlineOffset: 2,
+                                                }}
+                                            >
                                                 <div className="row row--between row--wrap">
                                                     <div className="row row--wrap">
                                                         <div style={{ fontWeight: 950 }}>
@@ -1559,14 +1605,27 @@ export default function CourierAppHome() {
                                                 <div className="row row--wrap row--mobile-stack">
                                                     <button
                                                         className="btn btn--success"
-                                                        onClick={() => acceptOffer(o)}
+                                                        onClick={(e) => {
+                                                            e.stopPropagation();
+                                                            setSelectedOfferId(o.id); // чтобы карта/выбор совпали
+                                                            acceptOffer(o);
+                                                        }}
                                                         disabled={isBusy || reachedMaxActive}
                                                     >
                                                         {isBusy ? t("courierWorking") : t("courierAccept")}
                                                     </button>
 
-                                                    <button className="btn btn--danger" onClick={() => declineOffer(o.id)} disabled={isBusy}>
-                                                        {isBusy ? t("courierWorking") : t("courierDecline")}
+
+                                                    <button
+                                                        className="btn btn--danger"
+                                                        onClick={(e) => {
+                                                            e.stopPropagation();
+                                                            declineOffer(o.id);
+                                                        }}
+                                                        disabled={isBusy}
+                                                    >
+
+                                                    {isBusy ? t("courierWorking") : t("courierDecline")}
                                                     </button>
                                                 </div>
                                             </div>

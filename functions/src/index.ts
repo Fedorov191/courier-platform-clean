@@ -267,6 +267,113 @@ export const getRouteQuote = onCall(
         };
     }
 );
+// ----------------------------
+// ROUTES API: OFFER ROUTE (polyline)
+// ----------------------------
+// Для courier map-first: рисуем линию маршрута ТОЛЬКО на экране pending offer.
+// Routes API key остаётся в SecretManager (GOOGLE_MAPS_API_KEY).
+
+type RoutePolylineResult = {
+    polyline: string;
+    distanceMeters: number;
+    durationSeconds: number;
+};
+
+function parseDurationSeconds(duration: any): number {
+    // Routes API duration приходит строкой вида "123s" (иногда "123.4s")
+    const durationStr = String(duration ?? "0s");
+    const m = durationStr.match(/^(\d+(?:\.\d+)?)s$/);
+    return m ? Number(m[1]) : 0;
+}
+
+async function computeRoutePolyline(origin: LatLng, destination: LatLng): Promise<RoutePolylineResult> {
+    const key = GOOGLE_MAPS_API_KEY.value();
+    const url = "https://routes.googleapis.com/directions/v2:computeRoutes";
+
+    const body = {
+        origin: { location: { latLng: { latitude: origin.lat, longitude: origin.lng } } },
+        destination: { location: { latLng: { latitude: destination.lat, longitude: destination.lng } } },
+        travelMode: "DRIVE",
+        routingPreference: "TRAFFIC_AWARE",
+        computeAlternativeRoutes: false,
+        languageCode: "en-US",
+        units: "METRIC",
+    };
+
+    const resp = await fetch(url, {
+        method: "POST",
+        headers: {
+            "Content-Type": "application/json",
+            "X-Goog-Api-Key": key,
+            // Важно: просим полилинию + distance + duration
+            "X-Goog-FieldMask": "routes.distanceMeters,routes.duration,routes.polyline.encodedPolyline",
+        },
+        body: JSON.stringify(body),
+    });
+
+    if (!resp.ok) {
+        const text = await resp.text().catch(() => "");
+        logger.warn("Routes API error (polyline)", { status: resp.status, text });
+        throw new HttpsError("internal", "Failed to compute route polyline");
+    }
+
+    const json: any = await resp.json();
+    const r0 = json?.routes?.[0];
+
+    const distanceMeters = Number(r0?.distanceMeters ?? NaN);
+    const durationSeconds = parseDurationSeconds(r0?.duration);
+    const polyline = String(r0?.polyline?.encodedPolyline ?? "");
+
+    if (!Number.isFinite(distanceMeters) || distanceMeters <= 0) {
+        throw new HttpsError("internal", "Route distance missing");
+    }
+    if (!polyline || polyline.length < 10) {
+        throw new HttpsError("internal", "Route polyline missing");
+    }
+
+    return { polyline, distanceMeters, durationSeconds };
+}
+
+export const getOfferRoute = onCall(
+    {
+        region: "europe-west1",
+        secrets: [GOOGLE_MAPS_API_KEY],
+    },
+    async (req) => {
+        if (!req.auth) throw new HttpsError("unauthenticated", "Login required");
+
+        const { courier, pickup, dropoff } = (req.data ?? {}) as {
+            courier?: LatLng | null;
+            pickup?: LatLng;
+            dropoff?: LatLng;
+        };
+
+        const okPickup = pickup && typeof pickup.lat === "number" && typeof pickup.lng === "number";
+        const okDropoff = dropoff && typeof dropoff.lat === "number" && typeof dropoff.lng === "number";
+        const okCourier = !courier || (typeof courier.lat === "number" && typeof courier.lng === "number");
+
+        if (!okPickup || !okDropoff || !okCourier) {
+            throw new HttpsError(
+                "invalid-argument",
+                "courier?(lat,lng), pickup(lat,lng), dropoff(lat,lng) required"
+            );
+        }
+
+        // pickup->dropoff (оплачиваемый)
+        // courier->pickup (не оплачиваемый, но можем показать серым/другим цветом)
+        const [pickupToDropoff, courierToPickup] = await Promise.all([
+            computeRoutePolyline(pickup as LatLng, dropoff as LatLng),
+            courier ? computeRoutePolyline(courier as LatLng, pickup as LatLng) : Promise.resolve(null),
+        ]);
+
+        return {
+            pickupToDropoff,
+            courierToPickup,
+            currency: "ILS",
+            pricingVersion: "v1_offer_route_2026_02",
+        };
+    }
+);
 
 /**
  * Главная функция: создать pending offer для order (если можно)
