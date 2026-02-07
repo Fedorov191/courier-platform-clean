@@ -1,6 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { auth, db } from "../lib/firebase";
-import { OrderChat } from "../components/OrderChat";
 import { enablePush } from "../lib/push";
 import { Capacitor } from "@capacitor/core";
 import { enableNativePush, initNativePushListeners } from "../lib/push.native";
@@ -23,196 +22,22 @@ import { useNavigate } from "react-router-dom";
 import { geohashForLocation } from "geofire-common";
 import { useI18n } from "../lib/i18n";
 
-type Offer = {
-    id: string;
-    orderId: string;
-    restaurantId: string;
-    courierId: string;
-    status: string;
+import type { Offer } from "../lib/courier.shared";
+import {
+    ensureNativeGeolocationPermission,
+    haversineMeters,
+    israelDateKey,
+} from "../lib/courier.shared";
 
-    customerName?: string;
-    customerPhone?: string;
-    customerAddress?: string;
-
-    dropoffLat?: number;
-    dropoffLng?: number;
-    dropoffGeohash?: string;
-    dropoffAddressText?: string;
-
-    pickupLat?: number;
-    pickupLng?: number;
-    pickupGeohash?: string;
-    pickupAddressText?: string;
-
-    paymentType?: string;
-    orderSubtotal?: number;
-    deliveryFee?: number;
-    orderTotal?: number;
-
-    courierPaysAtPickup?: number;
-    courierCollectsFromCustomer?: number;
-    courierGetsFromRestaurantAtPickup?: number;
-
-    shortCode?: string;
-
-    prepTimeMin?: number;
-    readyAtMs?: number;
-
-    // route / distance (server calculated)
-    routeDistanceMeters?: number;
-    routeDurationSeconds?: number;
-
-    // optional aliases (if order stores these)
-    deliveryDistanceMeters?: number;
-    deliveryDistanceKm?: number;
-
-    // structured dropoff fields (F)
-    dropoffStreet?: string;
-    dropoffHouseNumber?: string;
-    dropoffApartment?: string;
-    dropoffEntrance?: string;
-    dropoffComment?: string;
-};
-
-function shortId(id: string) {
-    return (id || "").slice(0, 6).toUpperCase();
-}
-
-// Israel TZ keys for reports
-function israelDateKey(d = new Date()) {
-    const parts = new Intl.DateTimeFormat("en-CA", {
-        timeZone: "Asia/Jerusalem",
-        year: "numeric",
-        month: "2-digit",
-        day: "2-digit",
-    }).formatToParts(d);
-
-    const y = parts.find((p) => p.type === "year")?.value ?? "0000";
-    const m = parts.find((p) => p.type === "month")?.value ?? "00";
-    const day = parts.find((p) => p.type === "day")?.value ?? "00";
-
-    return {
-        deliveredDateKey: `${y}-${m}-${day}`,
-        deliveredMonthKey: `${y}-${m}`,
-        deliveredYearKey: `${y}`,
-    };
-}
-
-function money(n?: number) {
-    const x = typeof n === "number" && Number.isFinite(n) ? n : 0;
-    return `₪${x.toFixed(2)}`;
-}
-
-function wazeUrl(lat?: number, lng?: number) {
-    if (typeof lat !== "number" || typeof lng !== "number") return null;
-    return `https://waze.com/ul?ll=${lat},${lng}&navigate=yes`;
-}
-function yandexMapsUrl(lat?: number, lng?: number) {
-    if (typeof lat !== "number" || typeof lng !== "number") return null;
-    return `https://yandex.com/maps/?pt=${lng},${lat}&z=17&l=map`;
-}
-function googleMapsUrl(lat?: number, lng?: number) {
-    if (typeof lat !== "number" || typeof lng !== "number") return null;
-    return `https://www.google.com/maps?q=${lat},${lng}`;
-}
+import { CourierActiveOrdersList } from "../components/courier/CourierActiveOrdersList";
+import { CourierOffersList } from "../components/courier/CourierOffersList";
+import { CourierCompletedOrdersList } from "../components/courier/CourierCompletedOrdersList";
 
 const MAX_ACTIVE_ORDERS = 3;
 const MAX_PENDING_OFFERS = 3;
 
 const GEO_WRITE_MIN_MS = 60_000;
 const GEO_MIN_MOVE_M = 150;
-
-function haversineMeters(lat1: number, lon1: number, lat2: number, lon2: number) {
-    const R = 6371000;
-    const toRad = (d: number) => (d * Math.PI) / 180;
-    const dLat = toRad(lat2 - lat1);
-    const dLon = toRad(lon2 - lon1);
-    const a =
-        Math.sin(dLat / 2) ** 2 +
-        Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon / 2) ** 2;
-    const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-    return R * c;
-}
-async function ensureNativeGeolocationPermission(): Promise<boolean> {
-    if (!Capacitor.isNativePlatform()) return true;
-
-    try {
-        let perm = await Geolocation.checkPermissions();
-
-        // perm.location: 'prompt' | 'granted' | 'denied'
-        if (perm.location !== "granted") {
-            perm = await Geolocation.requestPermissions({ permissions: ["location"] });
-        }
-
-        return perm.location === "granted";
-    } catch (e: any) {
-        // checkPermissions/requestPermissions могут бросить ошибку,
-        // если system location services выключены (GPS off)
-        // docs: "Will throw if system location services are disabled."
-        return false;
-    }
-}
-
-function pillToneForOrderStatus(status?: string) {
-    switch (status) {
-        case "taken":
-            return "warning";
-        case "picked_up":
-            return "info";
-        case "delivered":
-            return "success";
-        case "cancelled":
-            return "danger";
-        case "new":
-            return "info";
-        default:
-            return "muted";
-    }
-}
-
-function readyInText(readyAtMs?: number, nowMs?: number) {
-    if (typeof readyAtMs !== "number" || !Number.isFinite(readyAtMs)) return "—";
-    const diff = readyAtMs - (typeof nowMs === "number" ? nowMs : Date.now());
-    if (diff <= 0) return "READY";
-    const totalSec = Math.ceil(diff / 1000);
-    const mm = Math.floor(totalSec / 60);
-    const ss = totalSec % 60;
-    return `${mm}:${String(ss).padStart(2, "0")}`;
-}
-
-function kmTextFromMeters(m?: number, digits = 1) {
-    if (typeof m !== "number" || !Number.isFinite(m) || m <= 0) return "—";
-    return `${(m / 1000).toFixed(digits)} km`;
-}
-
-function getPickupToDropoffMeters(x: any): number | null {
-    const a = x?.routeDistanceMeters;
-    if (typeof a === "number" && Number.isFinite(a) && a > 0) return a;
-
-    const b = x?.deliveryDistanceMeters;
-    if (typeof b === "number" && Number.isFinite(b) && b > 0) return b;
-
-    const km = x?.deliveryDistanceKm;
-    if (typeof km === "number" && Number.isFinite(km) && km > 0) return km * 1000;
-
-    return null;
-}
-
-// Возвращаем “части”, а не готовые “Apt/Entrance” (чтобы локализовать в UI)
-function formatDropoffParts(o: any) {
-    const street = String(o?.dropoffStreet ?? "").trim();
-    const house = String(o?.dropoffHouseNumber ?? "").trim();
-    const apt = String(o?.dropoffApartment ?? "").trim();
-    const ent = String(o?.dropoffEntrance ?? "").trim();
-    const comment = String(o?.dropoffComment ?? o?.notes ?? "").trim();
-
-    const main =
-        [street, house].filter(Boolean).join(" ").trim() ||
-        String(o?.dropoffAddressText ?? o?.customerAddress ?? "").trim() ||
-        "—";
-
-    return { main, apt, ent, comment };
-}
 
 export default function CourierAppHome() {
     const nav = useNavigate();
@@ -222,11 +47,11 @@ export default function CourierAppHome() {
     const { t } = useI18n();
 
     const watchId = useRef<string | number | null>(null);
-
     const heartbeatId = useRef<number | null>(null);
 
     const lastGeoWriteMsRef = useRef<number>(0);
     const lastGeoRef = useRef<{ lat: number; lng: number } | null>(null);
+
     const [lastGeo, setLastGeo] = useState<{ lat: number; lng: number } | null>(null);
     const lastGeoUiSetMsRef = useRef(0);
 
@@ -260,7 +85,6 @@ export default function CourierAppHome() {
         return typeof Notification !== "undefined" && Notification.permission === "granted";
     });
 
-
     const enableCourierPush = useCallback(async () => {
         setErr(null);
         setPushBusy(true);
@@ -279,7 +103,6 @@ export default function CourierAppHome() {
             setPushBusy(false);
         }
     }, []);
-
 
     const [offers, setOffers] = useState<Offer[]>([]);
     const [selectedOfferId, setSelectedOfferId] = useState<string | null>(null);
@@ -318,39 +141,9 @@ export default function CourierAppHome() {
         return () => window.clearInterval(id);
     }, []);
 
-    function toggleChat(orderId: string) {
+    const toggleChat = useCallback((orderId: string) => {
         setChatOpenByOrderId((prev) => ({ ...prev, [orderId]: !prev[orderId] }));
-    }
-
-    function statusLabel(status?: string) {
-        switch (status) {
-            case "new":
-                return t("courierStatusNew");
-            case "taken":
-                return t("courierStatusTaken");
-            case "picked_up":
-                return t("courierStatusPickedUp");
-            case "delivered":
-                return t("courierStatusDelivered");
-            case "cancelled":
-                return t("courierStatusCancelled");
-            default:
-                return (status || "—").toUpperCase();
-        }
-    }
-
-    function paymentLabel(pt?: string) {
-        if (pt === "cash") return t("courierPaymentCash");
-        if (pt === "card") return t("courierPaymentCard");
-        return "—";
-    }
-
-    function dropoffExtra(apt?: string, ent?: string) {
-        const parts: string[] = [];
-        if (apt) parts.push(`${t("courierAptShort")} ${apt}`);
-        if (ent) parts.push(`${t("courierEntranceShort")} ${ent}`);
-        return parts.join(", ");
-    }
+    }, []);
 
     // =======================
     // AUDIO
@@ -362,7 +155,7 @@ export default function CourierAppHome() {
 
     function getOfferAudio() {
         if (!offerAudioRef.current) {
-            // Важно: файл должен лежать в web/public/sounds/offer.wav
+            // файл лежит в web/public/sounds/offer.wav
             const a = new Audio("/sounds/offer.wav");
             a.preload = "auto";
             a.volume = 1.0;
@@ -371,7 +164,6 @@ export default function CourierAppHome() {
             a.loop = false;
 
             a.addEventListener("ended", () => {
-                // если ещё нужно “звонить” — запускаем снова
                 if (!offerShouldRingRef.current) return;
                 try {
                     a.currentTime = 0;
@@ -384,19 +176,13 @@ export default function CourierAppHome() {
         return offerAudioRef.current;
     }
 
-
     async function startOfferRingtoneLoop() {
         try {
             const a = getOfferAudio();
-
-            // если уже играет — не дёргаем
             if (!a.paused) return;
-
             a.currentTime = 0;
             await a.play();
-        } catch {
-            // autoplay/permissions — молча
-        }
+        } catch {}
     }
 
     function stopOfferRingtoneLoop() {
@@ -408,9 +194,6 @@ export default function CourierAppHome() {
         } catch {}
     }
 
-
-
-
     function primeAudio() {
         const A = window.AudioContext || (window as any).webkitAudioContext;
         if (!A) return;
@@ -419,8 +202,6 @@ export default function CourierAppHome() {
             audioCtxRef.current.resume().catch(() => {});
         }
     }
-
-
 
     function playChatBeep() {
         const ctx = audioCtxRef.current;
@@ -444,11 +225,9 @@ export default function CourierAppHome() {
     // первый user gesture
     useEffect(() => {
         const handler = () => {
-            primeAudio(); // оставляем для chat-beep (AudioContext)
+            primeAudio();
             try {
-                // прогреем offer.wav, чтобы быстрее стартовал
                 getOfferAudio().load();
-
             } catch {}
         };
 
@@ -471,18 +250,11 @@ export default function CourierAppHome() {
             const shouldRing = hasOffers && document.visibilityState === "visible";
             offerShouldRingRef.current = shouldRing;
 
-            if (shouldRing) {
-                void startOfferRingtoneLoop();
-            } else {
-                stopOfferRingtoneLoop();
-            }
+            if (shouldRing) void startOfferRingtoneLoop();
+            else stopOfferRingtoneLoop();
         };
 
-        // каждый раз синкаем состояние
         sync();
-
-        // ВАЖНО: listener ставим даже если сейчас hidden,
-        // чтобы при возврате в приложение звук стартовал снова
         document.addEventListener("visibilitychange", sync);
 
         return () => {
@@ -506,24 +278,45 @@ export default function CourierAppHome() {
         [user]
     );
 
-    async function ensureChat(chatId: string, orderId: string, restaurantId: string) {
-        if (!user) return;
+    const ensureChat = useCallback(
+        async (chatId: string, orderId: string, restaurantId: string) => {
+            if (!user) return;
 
-        await setDoc(
-            doc(db, "chats", chatId),
-            {
-                orderId,
-                restaurantId,
-                courierId: user.uid,
-                updatedAt: serverTimestamp(),
+            await setDoc(
+                doc(db, "chats", chatId),
+                {
+                    orderId,
+                    restaurantId,
+                    courierId: user.uid,
+                    updatedAt: serverTimestamp(),
 
-                lastReadAtCourier: serverTimestamp(),
-                courierLastReadAt: serverTimestamp(),
-            },
-            { merge: true }
-        );
-    }
+                    lastReadAtCourier: serverTimestamp(),
+                    courierLastReadAt: serverTimestamp(),
+                },
+                { merge: true }
+            );
+        },
+        [user]
+    );
 
+    const handleChatButton = useCallback(
+        async (args: { orderId: string; chatId: string; restaurantId: string; willOpen: boolean }) => {
+            primeAudio();
+
+            if (args.willOpen) {
+                try {
+                    await ensureChat(args.chatId, args.orderId, args.restaurantId);
+                    await markChatRead(args.chatId);
+                } catch (e: any) {
+                    setErr(e?.message ?? t("courierErrorOpenChat"));
+                    return;
+                }
+            }
+
+            toggleChat(args.orderId);
+        },
+        [ensureChat, markChatRead, t, toggleChat]
+    );
 
     // ensure courier docs
     useEffect(() => {
@@ -689,8 +482,7 @@ export default function CourierAppHome() {
                     const lastAtMs = data.lastMessageAt?.toMillis?.() ?? 0;
                     const lastSenderId = String(data.lastMessageSenderId ?? "");
 
-                    const readAtMs =
-                        (data.lastReadAtCourier ?? data.courierLastReadAt)?.toMillis?.() ?? 0;
+                    const readAtMs = (data.lastReadAtCourier ?? data.courierLastReadAt)?.toMillis?.() ?? 0;
 
                     const isUnread = lastAtMs > readAtMs && lastSenderId && lastSenderId !== user.uid;
                     nextUnread[chatId] = !!isUnread;
@@ -713,7 +505,6 @@ export default function CourierAppHome() {
                             if (!isChatOpen) {
                                 playChatBeep();
                             } else {
-                                // чат открыт — сразу считаем прочитанным
                                 markChatRead(chatId);
                             }
                         }
@@ -773,7 +564,6 @@ export default function CourierAppHome() {
 
             setIsOnline(next);
             if (next) await startTracking();
-
         } catch (e: any) {
             setErr(e?.message ?? t("courierErrorUpdateStatus"));
         }
@@ -782,10 +572,9 @@ export default function CourierAppHome() {
     async function startTracking() {
         if (!courierPublicRef) return;
 
-        // В нативке НЕ используем navigator.geolocation — только Capacitor Geolocation
-        const isNative = Capacitor.isNativePlatform();
+        const isNativeBuild = Capacitor.isNativePlatform();
 
-        // 0) чистим старые таймеры/вотчи (если были)
+        // cleanup
         if (heartbeatId.current !== null) {
             window.clearInterval(heartbeatId.current);
             heartbeatId.current = null;
@@ -793,7 +582,7 @@ export default function CourierAppHome() {
 
         if (watchId.current !== null) {
             try {
-                if (isNative) {
+                if (isNativeBuild) {
                     await Geolocation.clearWatch({ id: String(watchId.current) });
                 } else if (navigator.geolocation) {
                     navigator.geolocation.clearWatch(Number(watchId.current));
@@ -802,7 +591,7 @@ export default function CourierAppHome() {
             watchId.current = null;
         }
 
-        // 1) Heartbeat раз в минуту: пишет lastSeen/координаты если они есть
+        // Heartbeat
         heartbeatId.current = window.setInterval(async () => {
             try {
                 const now = Date.now();
@@ -836,9 +625,7 @@ export default function CourierAppHome() {
             }
         }, GEO_WRITE_MIN_MS);
 
-        // 2) WatchPosition: разные реализации для Native и Web
-        if (isNative) {
-            // СНАЧАЛА запросим permission (иначе получишь "denied" без диалога)
+        if (isNativeBuild) {
             let perm = await Geolocation.checkPermissions();
             if (perm.location !== "granted") {
                 perm = await Geolocation.requestPermissions({ permissions: ["location"] });
@@ -849,7 +636,6 @@ export default function CourierAppHome() {
                 return;
             }
 
-            // Пробуем получить позицию сразу (чтобы поймать случай когда GPS выключен)
             try {
                 const first = await Geolocation.getCurrentPosition({
                     enableHighAccuracy: true,
@@ -857,18 +643,16 @@ export default function CourierAppHome() {
                     maximumAge: 10_000,
                 });
                 updateLastGeoUi(first.coords.latitude, first.coords.longitude);
-
             } catch (e: any) {
                 setErr(e?.message ?? "Failed to get location. Turn on GPS / Location Services.");
                 return;
             }
 
-            // Теперь ставим watch
             const id = await Geolocation.watchPosition(
                 { enableHighAccuracy: true, timeout: 10_000, maximumAge: 10_000 },
-                async (pos, err) => {
-                    if (err) {
-                        setErr(err.message ?? "Geolocation error");
+                async (pos, geoErr) => {
+                    if (geoErr) {
+                        setErr(geoErr.message ?? "Geolocation error");
                         return;
                     }
                     if (!pos) return;
@@ -880,7 +664,6 @@ export default function CourierAppHome() {
                     const moved = prev ? haversineMeters(prev.lat, prev.lng, latitude, longitude) : Infinity;
 
                     updateLastGeoUi(latitude, longitude);
-
 
                     const elapsed = now - lastGeoWriteMsRef.current;
                     const shouldWrite = elapsed >= GEO_WRITE_MIN_MS || moved >= GEO_MIN_MOVE_M;
@@ -913,11 +696,11 @@ export default function CourierAppHome() {
                 }
             );
 
-            watchId.current = id; // <-- string
+            watchId.current = id;
             return;
         }
 
-        // WEB fallback (браузер)
+        // WEB fallback
         if (!navigator.geolocation) {
             setErr(t("courierErrorGeoNotSupported"));
             return;
@@ -932,7 +715,6 @@ export default function CourierAppHome() {
                 const moved = prev ? haversineMeters(prev.lat, prev.lng, latitude, longitude) : Infinity;
 
                 updateLastGeoUi(latitude, longitude);
-
 
                 const elapsed = now - lastGeoWriteMsRef.current;
                 const shouldWrite = elapsed >= GEO_WRITE_MIN_MS || moved >= GEO_MIN_MOVE_M;
@@ -967,7 +749,6 @@ export default function CourierAppHome() {
             { enableHighAccuracy: true, maximumAge: 10_000, timeout: 10_000 }
         );
     }
-
 
     async function acceptOffer(offer: Offer) {
         if (!auth.currentUser) return;
@@ -1118,18 +899,16 @@ export default function CourierAppHome() {
                                     onClick={async () => {
                                         primeAudio();
 
-                                        // 0) Если это native build — сначала геолокация
+                                        // 0) native geo permission
                                         if (Capacitor.isNativePlatform()) {
                                             const okGeo = await ensureNativeGeolocationPermission();
                                             if (!okGeo) {
-                                                setErr(
-                                                    "Geolocation is required. Please enable Location (GPS) and allow Location permission for the app."
-                                                );
-                                                return; // НЕ уходим online
+                                                setErr("Geolocation is required. Please enable Location (GPS) and allow Location permission for the app.");
+                                                return;
                                             }
                                         }
 
-                                        // 1) Native push (Capacitor)
+                                        // 1) native push
                                         try {
                                             if (Capacitor.isNativePlatform()) {
                                                 await enableNativePush("courier");
@@ -1137,10 +916,10 @@ export default function CourierAppHome() {
                                             }
                                         } catch (e: any) {
                                             setErr(e?.message ?? "Failed to enable push notifications");
-                                            return; // если пуши не включились — НЕ уходим online
+                                            return;
                                         }
 
-                                        // 2) теперь можно online
+                                        // 2) online
                                         await setOnline(true);
                                     }}
                                     disabled={isOnline}
@@ -1148,11 +927,10 @@ export default function CourierAppHome() {
                                     {t("courierGoOnline")}
                                 </button>
 
-
-
                                 <button className="btn" onClick={() => setOnline(false)} disabled={!isOnline || hasActive}>
                                     {t("courierGoOffline")}
                                 </button>
+
                                 {!isNative && (
                                     <button
                                         className={`btn ${pushEnabled ? "btn--ghost" : "btn--primary"}`}
@@ -1198,8 +976,7 @@ export default function CourierAppHome() {
                                 className={`btn ${tab === "completed" ? "btn--primary" : "btn--ghost"}`}
                                 onClick={() => setTab("completed")}
                             >
-                                {t("courierCompletedTab")}{" "}
-                                <span className="pill pill--muted">{completedOrders.length}</span>
+                                {t("courierCompletedTab")} <span className="pill pill--muted">{completedOrders.length}</span>
                             </button>
                         </div>
                     </div>
@@ -1209,6 +986,7 @@ export default function CourierAppHome() {
                 {tab === "active" && (
                     <>
                         <div style={{ height: 12 }} />
+
                         <CourierMapPanel
                             courier={lastGeo}
                             offers={offers}
@@ -1219,425 +997,35 @@ export default function CourierAppHome() {
 
                         <div style={{ height: 12 }} />
 
-                        {/* Active orders */}
-                        {activeOrders.length > 0 && (
-                            <div className="stack">
-                                {activeOrders.slice(0, MAX_ACTIVE_ORDERS).map((ord: any) => {
-                                    const st: string | undefined = ord?.status;
-                                    const canPickup = st === "taken";
-                                    const canDeliver = st === "picked_up";
-                                    const readyText = readyInText(ord?.readyAtMs, nowMs);
-                                    const readyPill =
-                                        readyText === "READY"
-                                            ? t("courierReadyNow")
-                                            : `${t("courierReadyInLabel")} ${readyText}`;
+                        <CourierActiveOrdersList
+                            orders={activeOrders}
+                            max={MAX_ACTIVE_ORDERS}
+                            nowMs={nowMs}
+                            courier={lastGeo}
+                            userId={user.uid}
+                            chatOpenByOrderId={chatOpenByOrderId}
+                            unreadByChatId={unreadByChatId}
+                            busyOrderAction={busyOrderAction}
+                            onMarkPickedUp={markPickedUp}
+                            onMarkDelivered={markDelivered}
+                            onChatButton={handleChatButton}
+                        />
 
-                                    const code =
-                                        typeof ord?.shortCode === "string" && ord.shortCode
-                                            ? ord.shortCode
-                                            : shortId(ord.id);
-
-                                    const pickupMain =
-                                        wazeUrl(ord?.pickupLat, ord?.pickupLng) ??
-                                        googleMapsUrl(ord?.pickupLat, ord?.pickupLng);
-                                    const pickupYandex = yandexMapsUrl(ord?.pickupLat, ord?.pickupLng);
-
-                                    const dropoffMain =
-                                        wazeUrl(ord?.dropoffLat, ord?.dropoffLng) ??
-                                        googleMapsUrl(ord?.dropoffLat, ord?.dropoffLng);
-                                    const dropoffYandex = yandexMapsUrl(ord?.dropoffLat, ord?.dropoffLng);
-
-                                    const courierLoc = lastGeoRef.current;
-                                    const courierToPickupM =
-                                        courierLoc && typeof ord?.pickupLat === "number" && typeof ord?.pickupLng === "number"
-                                            ? haversineMeters(courierLoc.lat, courierLoc.lng, ord.pickupLat, ord.pickupLng)
-                                            : null;
-
-                                    const pickupToDropoffM = getPickupToDropoffMeters(ord);
-                                    const totalTripM = (courierToPickupM ?? 0) + (pickupToDropoffM ?? 0);
-
-                                    const drop = formatDropoffParts(ord);
-                                    const extra = dropoffExtra(drop.apt, drop.ent);
-
-                                    const chatId = `${ord.id}_${user.uid}`;
-                                    const hasUnread = !!unreadByChatId[chatId] && !chatOpenByOrderId[ord.id];
-
-                                    return (
-                                        <div key={ord.id} className="card">
-                                            <div className="card__inner">
-                                                <div className="row row--between row--wrap">
-                                                    <div className="row row--wrap">
-                                                        <div style={{ fontWeight: 950, fontSize: 16 }}>
-                                                            {t("courierActiveOrderTitle")}{" "}
-                                                            <span className="mono">#{code}</span>
-                                                        </div>
-
-                                                        <span className={`pill pill--${pillToneForOrderStatus(ord.status)}`}>
-                              {statusLabel(ord.status)}
-                            </span>
-                                                    </div>
-
-                                                    <div className="row row--wrap">
-                            <span className={`pill ${st === "taken" ? "pill--warning" : "pill--success"}`}>
-                              1 · {t("courierStatusTaken")}
-                            </span>
-                                                        <span className={`pill ${st === "picked_up" ? "pill--info" : "pill--muted"}`}>
-                              2 · {t("courierStatusPickedUp")}
-                            </span>
-                                                        <span className="pill pill--muted">3 · {t("courierStatusDelivered")}</span>
-
-                                                        <span className={`pill ${readyText === "READY" ? "pill--success" : "pill--muted"}`}>
-                              {readyPill}
-                            </span>
-                                                    </div>
-                                                </div>
-
-                                                <div className="hr" />
-
-                                                <div className="subcard">
-                                                    <div className="kv">
-                                                        <div className="line">
-                                                            <span>{t("courierCustomerLabel")}</span>
-                                                            <b>{ord.customerName ?? "—"}</b>
-                                                        </div>
-
-                                                        <div className="line">
-                                                            <span>{t("courierPhoneLabel")}</span>
-                                                            <b>
-                                                                {ord.customerPhone ? (
-                                                                    <a href={`tel:${ord.customerPhone}`} style={{ textDecoration: "none" }}>
-                                                                        {ord.customerPhone}
-                                                                    </a>
-                                                                ) : (
-                                                                    "—"
-                                                                )}
-                                                            </b>
-                                                        </div>
-
-                                                        <div className="line" style={{ alignItems: "baseline" }}>
-                                                            <span>{t("courierAddressLabel")}</span>
-                                                            <div style={{ textAlign: "right", fontWeight: 800 }}>
-                                                                <div>{drop.main}</div>
-                                                                {extra && <div className="muted" style={{ fontWeight: 600 }}>{extra}</div>}
-                                                                {drop.comment && <div className="muted" style={{ fontWeight: 600 }}>{drop.comment}</div>}
-                                                            </div>
-                                                        </div>
-
-                                                        <div className="line">
-                                                            <span>{t("courierToRestaurantLabel")}</span>
-                                                            <b>{courierToPickupM ? kmTextFromMeters(courierToPickupM) : "—"}</b>
-                                                        </div>
-
-                                                        <div className="line">
-                                                            <span>{t("courierPickupToDropoffLabel")}</span>
-                                                            <b>{pickupToDropoffM ? kmTextFromMeters(pickupToDropoffM) : "—"}</b>
-                                                        </div>
-
-                                                        <div className="line">
-                                                            <span>{t("courierTotalTripLabel")}</span>
-                                                            <b>{courierToPickupM || pickupToDropoffM ? kmTextFromMeters(totalTripM) : "—"}</b>
-                                                        </div>
-
-                                                        <div className="line">
-                                                            <span>{t("courierTotalLabel")}</span>
-                                                            <b>{money(ord.orderTotal)}</b>
-                                                        </div>
-
-                                                        <div className="line">
-                                                            <span>{t("courierYourFeeLabel")}</span>
-                                                            <b>{money(ord.deliveryFee)}</b>
-                                                        </div>
-
-                                                        <div className="line">
-                                                            <span>{t("courierPayLabel")}</span>
-                                                            <b>{paymentLabel(ord.paymentType)}</b>
-                                                        </div>
-                                                    </div>
-                                                </div>
-
-                                                <div style={{ height: 12 }} />
-
-                                                <div className="row row--wrap row--mobile-stack">
-                                                    <button
-                                                        className="btn btn--primary"
-                                                        onClick={() => markPickedUp(ord.id)}
-                                                        disabled={!canPickup || busyOrderAction !== null}
-                                                    >
-                                                        {busyOrderAction === "pickup" ? t("courierSaving") : t("courierPickedUpAction")}
-                                                    </button>
-
-                                                    <button
-                                                        className="btn btn--success"
-                                                        onClick={() => markDelivered(ord.id)}
-                                                        disabled={!canDeliver || busyOrderAction !== null}
-                                                    >
-                                                        {busyOrderAction === "deliver" ? t("courierSaving") : t("courierDeliveredAction")}
-                                                    </button>
-
-                                                    {canPickup && pickupMain && (
-                                                        <a className="btn btn--ghost" href={pickupMain} target="_blank" rel="noreferrer" onClick={(e) => e.stopPropagation()}>
-                                                            {t("courierRouteToRestaurant")}
-                                                        </a>
-                                                    )}
-                                                    {canPickup && pickupYandex && (
-                                                        <a className="btn btn--ghost" href={pickupYandex} target="_blank" rel="noreferrer" onClick={(e) => e.stopPropagation()}>
-                                                            {t("courierYandex")}
-                                                        </a>
-                                                    )}
-
-                                                    {canDeliver && dropoffMain && (
-                                                        <a className="btn btn--ghost" href={dropoffMain} target="_blank" rel="noreferrer">
-                                                            {t("courierRouteToCustomer")}
-                                                        </a>
-                                                    )}
-                                                    {canDeliver && dropoffYandex && (
-                                                        <a className="btn btn--ghost" href={dropoffYandex} target="_blank" rel="noreferrer">
-                                                            {t("courierYandex")}
-                                                        </a>
-                                                    )}
-
-                                                    <button
-                                                        className="btn btn--ghost"
-                                                        onClick={async () => {
-                                                            primeAudio();
-                                                            const willOpen = !chatOpenByOrderId[ord.id];
-
-                                                            if (willOpen) {
-                                                                try {
-                                                                    await ensureChat(chatId, ord.id, String(ord.restaurantId ?? ""));
-                                                                    await markChatRead(chatId);
-                                                                } catch (e: any) {
-                                                                    setErr(e?.message ?? t("courierErrorOpenChat"));
-                                                                    return;
-                                                                }
-                                                            }
-
-                                                            toggleChat(ord.id);
-                                                        }}
-                                                    >
-                                                        {chatOpenByOrderId[ord.id] ? t("courierHideChat") : t("courierChat")}
-                                                        {hasUnread && (
-                                                            <span
-                                                                style={{
-                                                                    display: "inline-block",
-                                                                    width: 8,
-                                                                    height: 8,
-                                                                    borderRadius: 999,
-                                                                    marginLeft: 8,
-                                                                    background: "crimson",
-                                                                }}
-                                                            />
-                                                        )}
-                                                    </button>
-                                                </div>
-
-                                                {chatOpenByOrderId[ord.id] && (
-                                                    <OrderChat
-                                                        chatId={chatId}
-                                                        orderId={ord.id}
-                                                        restaurantId={String(ord.restaurantId ?? "")}
-                                                        courierId={user.uid}
-                                                        myRole="courier"
-                                                        disabled={ord.status === "cancelled"}
-                                                    />
-                                                )}
-
-                                                {!canDeliver && (
-                                                    <div className="muted" style={{ marginTop: 10, fontSize: 13 }}>
-                                                        {t("courierTipDeliveredAfterPickup")}
-                                                    </div>
-                                                )}
-                                            </div>
-                                        </div>
-                                    );
-                                })}
-                            </div>
-                        )}
-
-                        {/* Offers */}
                         <div style={{ height: 12 }} />
-                        <div className="card">
-                            <div className="card__inner">
-                                <div className="row row--between row--wrap">
-                                    <div className="row row--wrap">
-                                        <h3 style={{ margin: 0 }}>{t("courierNewOffersTitle")}</h3>
-                                        <span className="pill pill--muted">{offers.length}</span>
-                                    </div>
 
-                                    <span className="pill pill--muted">
-                    {t("courierActiveCountLabel")} {activeCount}/{MAX_ACTIVE_ORDERS}
-                  </span>
-
-                                    {reachedMaxActive && (
-                                        <span className="pill pill--warning">
-                      {t("courierMaxActiveReached")} {MAX_ACTIVE_ORDERS}
-                    </span>
-                                    )}
-                                </div>
-
-                                <div className="hr" />
-
-                                {offers.length === 0 && <div className="muted">{t("courierNoNewOffers")}</div>}
-
-                                <div className="stack">
-                                    {offers.map((o) => {
-                                        const pickupMain =
-                                            wazeUrl(o.pickupLat, o.pickupLng) ?? googleMapsUrl(o.pickupLat, o.pickupLng);
-                                        const pickupYandex = yandexMapsUrl(o.pickupLat, o.pickupLng);
-
-                                        const isBusy = busyOfferId === o.id;
-                                        const offerCode =
-                                            typeof o.shortCode === "string" && o.shortCode ? o.shortCode : shortId(o.orderId);
-
-                                        const readyText = readyInText(o.readyAtMs, nowMs);
-                                        const readyPill =
-                                            readyText === "READY"
-                                                ? t("courierReadyNow")
-                                                : `${t("courierReadyInLabel")} ${readyText}`;
-
-                                        const courierLoc = lastGeoRef.current;
-                                        const courierToPickupM =
-                                            courierLoc && typeof o?.pickupLat === "number" && typeof o?.pickupLng === "number"
-                                                ? haversineMeters(courierLoc.lat, courierLoc.lng, o.pickupLat, o.pickupLng)
-                                                : null;
-
-                                        const pickupToDropoffM = getPickupToDropoffMeters(o);
-                                        const totalTripM = (courierToPickupM ?? 0) + (pickupToDropoffM ?? 0);
-
-                                        const drop = formatDropoffParts(o);
-                                        const extra = dropoffExtra(drop.apt, drop.ent);
-
-                                        return (
-                                            <div
-                                                key={o.id}
-                                                className="subcard"
-                                                onClick={() => setSelectedOfferId(o.id)}
-                                                style={{
-                                                    cursor: "pointer",
-                                                    outline: o.id === selectedOfferId ? "2px solid #111" : "1px solid transparent",
-                                                    outlineOffset: 2,
-                                                }}
-                                            >
-                                                <div className="row row--between row--wrap">
-                                                    <div className="row row--wrap">
-                                                        <div style={{ fontWeight: 950 }}>
-                                                            {t("courierOrderLabel")} <span className="mono">#{offerCode}</span>
-                                                        </div>
-
-                                                        <span className={`pill ${o.paymentType === "cash" ? "pill--muted" : "pill--info"}`}>
-                              {paymentLabel(o.paymentType)}
-                            </span>
-
-                                                        <span className="pill pill--success">
-                              {t("courierFeeLabel")} {money(o.deliveryFee)}
-                            </span>
-
-                                                        <span className={`pill ${readyText === "READY" ? "pill--success" : "pill--muted"}`}>
-                              {readyPill}
-                            </span>
-                                                    </div>
-
-                                                    {pickupMain && (
-                                                        <a className="btn btn--ghost" href={pickupMain} target="_blank" rel="noreferrer">
-                                                            {t("courierRouteToRestaurant")}
-                                                        </a>
-                                                    )}
-                                                    {pickupYandex && (
-                                                        <a className="btn btn--ghost" href={pickupYandex} target="_blank" rel="noreferrer">
-                                                            {t("courierYandex")}
-                                                        </a>
-                                                    )}
-                                                </div>
-
-                                                <div style={{ height: 10 }} />
-
-                                                <div className="kv">
-                                                    <div className="line">
-                                                        <span>{t("courierCustomerLabel")}</span>
-                                                        <b>{o.customerName ?? "—"}</b>
-                                                    </div>
-
-                                                    <div className="line">
-                                                        <span>{t("courierPhoneLabel")}</span>
-                                                        <b>
-                                                            {o.customerPhone ? (
-                                                                <a href={`tel:${o.customerPhone}`} style={{ textDecoration: "none" }}>
-                                                                    {o.customerPhone}
-                                                                </a>
-                                                            ) : (
-                                                                "—"
-                                                            )}
-                                                        </b>
-                                                    </div>
-
-                                                    <div className="line" style={{ alignItems: "baseline" }}>
-                                                        <span>{t("courierAddressLabel")}</span>
-                                                        <div style={{ textAlign: "right", fontWeight: 800 }}>
-                                                            <div>{drop.main}</div>
-                                                            {extra && <div className="muted" style={{ fontWeight: 600 }}>{extra}</div>}
-                                                            {drop.comment && <div className="muted" style={{ fontWeight: 600 }}>{drop.comment}</div>}
-                                                        </div>
-                                                    </div>
-
-                                                    <div className="line">
-                                                        <span>{t("courierToRestaurantLabel")}</span>
-                                                        <b>{courierToPickupM ? kmTextFromMeters(courierToPickupM) : "—"}</b>
-                                                    </div>
-
-                                                    <div className="line">
-                                                        <span>{t("courierPickupToDropoffLabel")}</span>
-                                                        <b>{pickupToDropoffM ? kmTextFromMeters(pickupToDropoffM) : "—"}</b>
-                                                    </div>
-
-                                                    <div className="line">
-                                                        <span>{t("courierTotalTripLabel")}</span>
-                                                        <b>{courierToPickupM || pickupToDropoffM ? kmTextFromMeters(totalTripM) : "—"}</b>
-                                                    </div>
-
-                                                    <div className="line">
-                                                        <span>{t("courierTotalLabel")}</span>
-                                                        <b>{money(o.orderTotal)}</b>
-                                                    </div>
-                                                </div>
-
-                                                <div style={{ height: 12 }} />
-
-                                                <div className="row row--wrap row--mobile-stack">
-                                                    <button
-                                                        className="btn btn--success"
-                                                        onClick={(e) => {
-                                                            e.stopPropagation();
-                                                            setSelectedOfferId(o.id); // чтобы карта/выбор совпали
-                                                            acceptOffer(o);
-                                                        }}
-                                                        disabled={isBusy || reachedMaxActive}
-                                                    >
-                                                        {isBusy ? t("courierWorking") : t("courierAccept")}
-                                                    </button>
-
-
-                                                    <button
-                                                        className="btn btn--danger"
-                                                        onClick={(e) => {
-                                                            e.stopPropagation();
-                                                            declineOffer(o.id);
-                                                        }}
-                                                        disabled={isBusy}
-                                                    >
-
-                                                    {isBusy ? t("courierWorking") : t("courierDecline")}
-                                                    </button>
-                                                </div>
-                                            </div>
-                                        );
-                                    })}
-                                </div>
-
-                                <div className="muted" style={{ marginTop: 12, fontSize: 12 }}>
-                                    {t("courierPresenceHint")}
-                                </div>
-                            </div>
-                        </div>
+                        <CourierOffersList
+                            offers={offers}
+                            selectedOfferId={selectedOfferId}
+                            setSelectedOfferId={setSelectedOfferId}
+                            busyOfferId={busyOfferId}
+                            reachedMaxActive={reachedMaxActive}
+                            activeCount={activeCount}
+                            maxActive={MAX_ACTIVE_ORDERS}
+                            nowMs={nowMs}
+                            courier={lastGeo}
+                            onAcceptOffer={acceptOffer}
+                            onDeclineOffer={declineOffer}
+                        />
                     </>
                 )}
 
@@ -1655,56 +1043,7 @@ export default function CourierAppHome() {
 
                                 <div className="hr" />
 
-                                {completedOrders.length === 0 && <div className="muted">{t("courierNoCompletedOrders")}</div>}
-
-                                <div className="stack">
-                                    {completedOrders.map((o: any) => {
-                                        const code =
-                                            typeof o?.shortCode === "string" && o.shortCode ? o.shortCode : shortId(o.id);
-
-                                        const drop = formatDropoffParts(o);
-                                        const extra = dropoffExtra(drop.apt, drop.ent);
-
-                                        return (
-                                            <div key={o.id} className="subcard">
-                                                <div className="row row--between row--wrap">
-                                                    <div style={{ fontWeight: 950 }}>
-                                                        {t("courierOrderLabel")} <span className="mono">#{code}</span>
-                                                    </div>
-                                                    <span className="pill pill--success">{t("courierStatusDelivered")}</span>
-                                                </div>
-
-                                                <div style={{ height: 10 }} />
-
-                                                <div className="kv">
-                                                    <div className="line">
-                                                        <span>{t("courierCustomerLabel")}</span>
-                                                        <b>{o.customerName ?? "—"}</b>
-                                                    </div>
-
-                                                    <div className="line" style={{ alignItems: "baseline" }}>
-                                                        <span>{t("courierAddressLabel")}</span>
-                                                        <div style={{ textAlign: "right", fontWeight: 800 }}>
-                                                            <div>{drop.main}</div>
-                                                            {extra && <div className="muted" style={{ fontWeight: 600 }}>{extra}</div>}
-                                                            {drop.comment && <div className="muted" style={{ fontWeight: 600 }}>{drop.comment}</div>}
-                                                        </div>
-                                                    </div>
-
-                                                    <div className="line">
-                                                        <span>{t("courierTotalLabel")}</span>
-                                                        <b>{money(o.orderTotal)}</b>
-                                                    </div>
-
-                                                    <div className="line">
-                                                        <span>{t("courierYourFeeLabel")}</span>
-                                                        <b>{money(o.deliveryFee)}</b>
-                                                    </div>
-                                                </div>
-                                            </div>
-                                        );
-                                    })}
-                                </div>
+                                <CourierCompletedOrdersList orders={completedOrders} />
 
                                 <div className="muted" style={{ marginTop: 12, fontSize: 12 }}>
                                     {t("courierDeliveredOrdersShownHint")}
