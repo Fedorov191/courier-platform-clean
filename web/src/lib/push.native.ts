@@ -91,33 +91,38 @@ export async function enableNativePush(scope: PushScope): Promise<string> {
         let hReg: PluginListenerHandle | null = null;
         let hErr: PluginListenerHandle | null = null;
 
-        const timeoutId = window.setTimeout(() => {
-            reject(new Error("FCM token timeout"));
-        }, 15000);
-
-        try {
-            hReg = await PushNotifications.addListener("registration", (t: Token) => {
-                window.clearTimeout(timeoutId);
-                resolve(t.value);
-            });
-
-            hErr = await PushNotifications.addListener("registrationError", (err: any) => {
-                window.clearTimeout(timeoutId);
-                reject(new Error(err?.error ?? "FCM registration error"));
-            });
-
-            await PushNotifications.register();
-        } catch (e: any) {
-            window.clearTimeout(timeoutId);
-            reject(e);
-        } finally {
-            // IMPORTANT: remove handles correctly (они async)
+        const cleanup = async () => {
             try {
                 if (hReg) await hReg.remove();
             } catch {}
             try {
                 if (hErr) await hErr.remove();
             } catch {}
+            hReg = null;
+            hErr = null;
+        };
+
+        const timeoutId = window.setTimeout(() => {
+            cleanup().finally(() => reject(new Error("FCM token timeout")));
+        }, 15000);
+
+        try {
+            hReg = await PushNotifications.addListener("registration", (t: Token) => {
+                window.clearTimeout(timeoutId);
+                cleanup().finally(() => resolve(t.value));
+            });
+
+            hErr = await PushNotifications.addListener("registrationError", (err: any) => {
+                window.clearTimeout(timeoutId);
+                cleanup().finally(() =>
+                    reject(new Error(err?.error ?? "FCM registration error"))
+                );
+            });
+
+            await PushNotifications.register();
+        } catch (e: any) {
+            window.clearTimeout(timeoutId);
+            cleanup().finally(() => reject(e));
         }
     });
 

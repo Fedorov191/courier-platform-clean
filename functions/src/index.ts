@@ -43,6 +43,7 @@ const COURIERS_LIMIT = 200;
 
 // сколько документов обрабатываем за тик
 const TICK_LIMIT = 200;
+const ACTIVE_ORDER_STATUSES = ["taken", "picked_up"] as const;
 
 // TTL field name (ВАЖНО: это имя ты выбираешь в Firestore TTL настройке)
 const TTL_FIELD = "cleanupAt"; // ✅ так и оставляем
@@ -80,6 +81,67 @@ type CourierPublic = {
     activeOrdersCount?: number;
     pendingOffersCount?: number;
 };
+// ----------------------------
+// COUNTERS: activeOrdersCount / pendingOffersCount
+// ----------------------------
+
+async function setCourierPublicCounters(
+    courierId: string,
+    patch: Record<string, any>
+): Promise<void> {
+    if (!courierId) return;
+    await db
+        .collection("courierPublic")
+        .doc(courierId)
+        .set(
+            {
+                ...patch,
+                countersUpdatedAt: FieldValue.serverTimestamp(),
+            },
+            { merge: true }
+        );
+}
+
+async function recountPendingOffersCount(courierId: string): Promise<void> {
+    if (!courierId) return;
+
+    const nowMs = Date.now();
+
+    // ⚠️ без range-фильтра по expiresAtMs, чтобы не требовать новый индекс.
+    // (courierId + status индекс у нас уже есть)
+    const snap = await db
+        .collection("offers")
+        .where("courierId", "==", courierId)
+        .where("status", "==", "pending")
+        .limit(50)
+        .get();
+
+    let count = 0;
+    for (const d of snap.docs) {
+        const off: any = d.data();
+        const exp = Number(off.expiresAtMs ?? 0);
+        if (exp > nowMs) {
+            count++;
+            if (count >= MAX_PENDING_OFFERS + 5) break; // порог важнее точности
+        }
+    }
+
+    await setCourierPublicCounters(courierId, { pendingOffersCount: count });
+}
+
+async function recountActiveOrdersCount(courierId: string): Promise<void> {
+    if (!courierId) return;
+
+    const snap = await db
+        .collection("orders")
+        .where("assignedCourierId", "==", courierId)
+        .where("status", "in", Array.from(ACTIVE_ORDER_STATUSES))
+        .limit(50)
+        .get();
+
+    const count = Math.min(snap.size, MAX_ACTIVE_ORDERS + 5);
+    await setCourierPublicCounters(courierId, { activeOrdersCount: count });
+}
 
 function pickCourierId(order: any, candidates: CourierPublic[]): string | null {
     const pickupLat = order?.pickupLat;
@@ -455,6 +517,63 @@ async function dispatchOrder(orderId: string, reason: string) {
 // ----------------------------
 // TRIGGERS
 // ----------------------------
+// -------------------------------------
+// COUNTERS TRIGGERS
+// -------------------------------------
+
+export const syncPendingOffersCountOnOfferCreate = onDocumentCreated(
+    "offers/{offerId}",
+    async (event) => {
+        const offer: any = event.data?.data();
+        const courierId = String(offer?.courierId ?? "");
+        if (!courierId) return;
+        await recountPendingOffersCount(courierId);
+    }
+);
+
+export const syncPendingOffersCountOnOfferUpdate = onDocumentUpdated(
+    "offers/{offerId}",
+    async (event) => {
+        const before: any = event.data?.before.data();
+        const after: any = event.data?.after.data();
+        if (!before || !after) return;
+
+        const beforeCourierId = String(before.courierId ?? "");
+        const afterCourierId = String(after.courierId ?? "");
+
+        const statusChanged = String(before.status ?? "") !== String(after.status ?? "");
+        const expChanged = Number(before.expiresAtMs ?? 0) !== Number(after.expiresAtMs ?? 0);
+        const courierChanged = beforeCourierId !== afterCourierId;
+
+        if (!statusChanged && !expChanged && !courierChanged) return;
+
+        if (beforeCourierId) await recountPendingOffersCount(beforeCourierId);
+        if (afterCourierId && afterCourierId !== beforeCourierId) {
+            await recountPendingOffersCount(afterCourierId);
+        }
+    }
+);
+
+export const syncActiveOrdersCountOnOrderUpdate = onDocumentUpdated(
+    "orders/{orderId}",
+    async (event) => {
+        const before: any = event.data?.before.data();
+        const after: any = event.data?.after.data();
+        if (!before || !after) return;
+
+        const beforeCourierId = String(before.assignedCourierId ?? "");
+        const afterCourierId = String(after.assignedCourierId ?? "");
+        const statusChanged = String(before.status ?? "") !== String(after.status ?? "");
+        const courierChanged = beforeCourierId !== afterCourierId;
+
+        if (!statusChanged && !courierChanged) return;
+
+        if (beforeCourierId) await recountActiveOrdersCount(beforeCourierId);
+        if (afterCourierId && afterCourierId !== beforeCourierId) {
+            await recountActiveOrdersCount(afterCourierId);
+        }
+    }
+);
 
 // 1) Новый заказ → сразу пробуем оффер
 export const dispatchOnOrderCreate = onDocumentCreated("orders/{orderId}", async (event) => {

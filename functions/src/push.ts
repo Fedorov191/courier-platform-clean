@@ -17,17 +17,45 @@ function userDocRef(scope: PushScope, uid: string) {
     return db.collection(scope === "courier" ? "couriers" : "restaurants").doc(uid);
 }
 
+/**
+ * ✅ Собираем токены из двух источников:
+ * 1) legacy web: userDoc.pushTokens: string[]
+ * 2) native Capacitor: userDoc/fcmTokens/{token} (docId == token)
+ */
 async function getPushTokens(scope: PushScope, uid: string): Promise<string[]> {
     if (!uid) return [];
-    const snap = await userDocRef(scope, uid).get();
-    if (!snap.exists) return [];
 
-    const data: any = snap.data();
-    const arr = Array.isArray(data?.pushTokens) ? data.pushTokens : [];
-    const tokens = arr.filter((x: any) => typeof x === "string" && x.length > 10);
-    return Array.from(new Set(tokens));
+    const ref = userDocRef(scope, uid);
+
+    const [snap, fcmSnap] = await Promise.all([
+        ref.get(),
+        // ограничим, чтобы не улететь по стоимости если вдруг накопится мусор
+        ref.collection("fcmTokens").limit(250).get().catch(() => null),
+    ]);
+
+    const fromArray: string[] = [];
+    if (snap.exists) {
+        const data: any = snap.data();
+        const arr = Array.isArray(data?.pushTokens) ? data.pushTokens : [];
+        for (const x of arr) {
+            if (typeof x === "string" && x.length > 10) fromArray.push(x);
+        }
+    }
+
+    const fromSub: string[] = [];
+    if (fcmSnap) {
+        for (const d of fcmSnap.docs) {
+            const token = d.id; // у вас docId == token
+            if (typeof token === "string" && token.length > 10) fromSub.push(token);
+        }
+    }
+
+    return Array.from(new Set([...fromArray, ...fromSub]));
 }
 
+/**
+ * ✅ Удаляем плохие токены и из массива pushTokens[], и из subcollection fcmTokens/{token}
+ */
 async function removeBadTokens(scope: PushScope, uid: string, bad: string[]) {
     if (!uid || bad.length === 0) return;
 
@@ -37,13 +65,24 @@ async function removeBadTokens(scope: PushScope, uid: string, bad: string[]) {
     const chunkSize = 10;
     for (let i = 0; i < bad.length; i += chunkSize) {
         const part = bad.slice(i, i + chunkSize);
-        await ref.set(
+
+        // 1) чистим массив pushTokens[]
+        const p1 = ref.set(
             {
                 pushTokens: FieldValue.arrayRemove(...part),
                 pushUpdatedAt: FieldValue.serverTimestamp(),
             },
             { merge: true }
         );
+
+        // 2) удаляем документы из fcmTokens/{token}
+        const batch = db.batch();
+        for (const t of part) {
+            batch.delete(ref.collection("fcmTokens").doc(t));
+        }
+        const p2 = batch.commit().catch(() => null);
+
+        await Promise.all([p1, p2]);
     }
 }
 
@@ -90,7 +129,7 @@ export const notifyOfferCreated = onDocumentCreated(
         const courierId = String(offer.courierId ?? "");
         if (!courierId) return;
 
-        // ✅ пуш только если курьер online (как ты просила)
+        // ✅ пуш только если курьер online
         const cpSnap = await db.collection("courierPublic").doc(courierId).get();
         const cp: any = cpSnap.exists ? cpSnap.data() : null;
         if (!cp || cp.isOnline !== true) return;
@@ -106,7 +145,7 @@ export const notifyOfferCreated = onDocumentCreated(
         const title = "New offer";
         const body = feeTxt ? `#${code} • Fee ${feeTxt}` : `#${code}`;
 
-        // ✅ для нативки лучше относительный путь (чтобы обрабатывать в native handler)
+        // ✅ для нативки лучше относительный путь
         const link = "/courier/app";
 
         await sendPushToUser("courier", courierId, {
@@ -121,8 +160,6 @@ export const notifyOfferCreated = onDocumentCreated(
             },
 
             // ✅ Android: high + channel offers + sound offer
-            // Важно: канал "offers" должен быть создан на устройстве в нативном коде,
-            // а звук "offer" должен лежать в android/app/src/main/res/raw/offer.(mp3|wav|ogg)
             android: {
                 priority: "high",
                 notification: {
@@ -187,7 +224,6 @@ export const notifyChatMessageCreated = onDocumentCreated(
                 if (!restaurantId) return;
                 const link = `${APP_BASE_URL}/restaurant/app/orders`;
                 await sendPushToUser("restaurant", restaurantId, {
-                    // оставляем data-only как было
                     data: {
                         type: "chat",
                         title,
@@ -201,7 +237,6 @@ export const notifyChatMessageCreated = onDocumentCreated(
                 if (!courierId) return;
                 const link = `${APP_BASE_URL}/courier/app`;
                 await sendPushToUser("courier", courierId, {
-                    // оставляем data-only как было
                     data: {
                         type: "chat",
                         title,
