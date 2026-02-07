@@ -147,7 +147,7 @@ async function ensureNativeGeolocationPermission(): Promise<boolean> {
     } catch (e: any) {
         // checkPermissions/requestPermissions могут бросить ошибку,
         // если system location services выключены (GPS off)
-        // docs: "Will throw if system location services are disabled." :contentReference[oaicite:3]{index=3}
+        // docs: "Will throw if system location services are disabled."
         return false;
     }
 }
@@ -331,6 +331,60 @@ export default function CourierAppHome() {
     // AUDIO
     // =======================
     const audioCtxRef = useRef<AudioContext | null>(null);
+    // ===== OFFER RINGTONE (wav loop) =====
+    const offerAudioRef = useRef<HTMLAudioElement | null>(null);
+    const offerShouldRingRef = useRef(false);
+
+    function getOfferAudio() {
+        if (!offerAudioRef.current) {
+            // Важно: файл должен лежать в web/public/sounds/offer.wav
+            const a = new Audio("/sounds/offer.wav");
+            a.preload = "auto";
+            a.volume = 1.0;
+
+            // Не надеемся на a.loop в WebView — делаем повтор сами:
+            a.loop = false;
+
+            a.addEventListener("ended", () => {
+                // если ещё нужно “звонить” — запускаем снова
+                if (!offerShouldRingRef.current) return;
+                try {
+                    a.currentTime = 0;
+                    void a.play();
+                } catch {}
+            });
+
+            offerAudioRef.current = a;
+        }
+        return offerAudioRef.current;
+    }
+
+
+    async function startOfferRingtoneLoop() {
+        try {
+            const a = getOfferAudio();
+
+            // если уже играет — не дёргаем
+            if (!a.paused) return;
+
+            a.currentTime = 0;
+            await a.play();
+        } catch {
+            // autoplay/permissions — молча
+        }
+    }
+
+    function stopOfferRingtoneLoop() {
+        const a = offerAudioRef.current;
+        if (!a) return;
+        try {
+            a.pause();
+            a.currentTime = 0;
+        } catch {}
+    }
+
+
+
 
     function primeAudio() {
         const A = window.AudioContext || (window as any).webkitAudioContext;
@@ -341,24 +395,7 @@ export default function CourierAppHome() {
         }
     }
 
-    function playOfferBeep() {
-        const ctx = audioCtxRef.current;
-        if (!ctx) return;
-        if (ctx.state === "suspended") return;
 
-        const osc = ctx.createOscillator();
-        const gain = ctx.createGain();
-        osc.type = "sine";
-        osc.frequency.value = 880;
-        gain.gain.value = 0.05;
-
-        osc.connect(gain);
-        gain.connect(ctx.destination);
-
-        const t0 = ctx.currentTime;
-        osc.start(t0);
-        osc.stop(t0 + 0.08);
-    }
 
     function playChatBeep() {
         const ctx = audioCtxRef.current;
@@ -381,10 +418,19 @@ export default function CourierAppHome() {
 
     // первый user gesture
     useEffect(() => {
-        const handler = () => primeAudio();
+        const handler = () => {
+            primeAudio(); // оставляем для chat-beep (AudioContext)
+            try {
+                // прогреем offer.wav, чтобы быстрее стартовал
+                getOfferAudio().load();
+
+            } catch {}
+        };
+
         window.addEventListener("pointerdown", handler, { once: true });
         return () => window.removeEventListener("pointerdown", handler);
     }, []);
+
     useEffect(() => {
         // в нативной сборке повесим listeners один раз
         if (Capacitor.isNativePlatform()) {
@@ -392,14 +438,33 @@ export default function CourierAppHome() {
         }
     }, []);
 
-    // offers beep каждую секунду пока есть offers
+    // offers ringtone loop пока есть offers
     useEffect(() => {
-        if (!isOnline) return;
-        if (offers.length === 0) return;
+        const hasOffers = isOnline && offers.length > 0;
 
-        playOfferBeep();
-        const id = window.setInterval(() => playOfferBeep(), 1000);
-        return () => window.clearInterval(id);
+        const sync = () => {
+            const shouldRing = hasOffers && document.visibilityState === "visible";
+            offerShouldRingRef.current = shouldRing;
+
+            if (shouldRing) {
+                void startOfferRingtoneLoop();
+            } else {
+                stopOfferRingtoneLoop();
+            }
+        };
+
+        // каждый раз синкаем состояние
+        sync();
+
+        // ВАЖНО: listener ставим даже если сейчас hidden,
+        // чтобы при возврате в приложение звук стартовал снова
+        document.addEventListener("visibilitychange", sync);
+
+        return () => {
+            document.removeEventListener("visibilitychange", sync);
+            offerShouldRingRef.current = false;
+            stopOfferRingtoneLoop();
+        };
     }, [isOnline, offers.length]);
 
     const markChatRead = useCallback(
